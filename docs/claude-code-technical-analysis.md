@@ -1,0 +1,3259 @@
+# Claude Code 技术架构深度解析：工程智慧与架构之道
+
+> **摘要**：Claude Code 是 Anthropic 推出的命令行 AI 编程助手，代表了当前 AI Agent 工程实现的最高水平。本文从源码层面深入剖析其架构设计、核心技术原理和设计哲学，揭示其为何能够成为行业标杆。
+
+---
+
+## 一、项目概述与定位
+
+Claude Code 不是普通的代码补全工具，而是一个**真正的 AI Agent**——它不仅能理解代码，还能执行命令、修改文件、调用 API，甚至协调多个子代理完成复杂任务。其核心价值在于**将 LLM 从文本生成器转变为能够实际操作计算机系统的智能体**。
+
+从工程角度看，Claude Code 的代码量（约 50 万行 TypeScript）和架构复杂度（涵盖工具系统、权限模型、状态管理、多代理协作等模块）使其成为 AI Agent 工程化的典范。理解它的设计，就是理解"如何让 AI 安全、可靠、高效地操作真实世界系统"这一核心命题的工程答案。
+
+---
+
+## 二、源码项目结构全景与架构图
+
+### 2.1 系统架构总览图
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                                    用户交互层 (CLI/TUI)                                │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌───────────┐  │
+│  │  Ink/React  │  │  输入处理   │  │  消息渲染   │  │  权限对话框 │  │  Vim模式  │  │
+│  │  组件系统   │  │  InputBox   │  │  Messages   │  │  Permission │  │  快捷键   │  │
+│  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘  └─────┬─────┘  │
+│         └─────────────────┴─────────────────┴─────────────────┴─────────────────┘   │
+│                                       │                                              │
+│                              useSyncExternalStore                                   │
+│                                       │                                              │
+└───────────────────────────────────────┼──────────────────────────────────────────────┘
+                                        │
+                                        ▼
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                                  状态管理层 (State)                                   │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐   │
+│  │                         AppState (React 状态树)                               │   │
+│  │  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐           │   │
+│  │  │ Messages │ │  Tasks   │ │Permissions│ │   UI     │ │UserInput │           │   │
+│  │  │ 消息历史 │ │ 任务列表 │ │ 权限状态  │ │ UI状态   │ │ 用户输入 │           │   │
+│  │  └──────────┘ └──────────┘ └──────────┘ └──────────┘ └──────────┘           │   │
+│  └─────────────────────────────────────────────────────────────────────────────┘   │
+│                                       │                                              │
+│                              createSignal (跨层级通信)                               │
+│                                       │                                              │
+└───────────────────────────────────────┼──────────────────────────────────────────────┘
+                                        │
+                                        ▼
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                              核心引擎层 (QueryEngine)                                 │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐   │
+│  │                         PDAOL Agent 循环                                      │   │
+│  │                                                                              │   │
+│  │   用户输入 ──▶ [感知]构建系统提示 ──▶ [决策]调用Claude API                     │   │
+│  │                              │                        │                      │   │
+│  │                              ▼                        ▼                      │   │
+│  │   最终结果 ◀── [循环]继续? ◀── [观察]工具结果 ◀── [行动]执行工具               │   │
+│  │                                                                              │   │
+│  │   ┌──────────────────────────────────────────────────────────────────┐      │   │
+│  │   │                    StreamingToolExecutor                         │      │   │
+│  │   │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐        │      │   │
+│  │   │  │ 并发控制 │  │ 进度流   │  │ 错误级联 │  │ 取消处理 │        │      │   │
+│  │   │  └──────────┘  └──────────┘  └──────────┘  └──────────┘        │      │   │
+│  │   └──────────────────────────────────────────────────────────────────┘      │   │
+│  └─────────────────────────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+                                        │
+                                        ▼
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                               能力层 (Tools & Services)                               │
+│  ┌──────────────┐ ┌──────────────┐ ┌──────────────┐ ┌──────────────┐ ┌──────────┐  │
+│  │   内置工具   │ │   MCP集成    │ │  多代理系统  │ │   任务系统   │ │ LSP集成  │  │
+│  │  43个工具    │ │ 外部工具扩展 │ │ AgentTool    │ │ 后台执行    │ │代码智能  │  │
+│  └──────┬───────┘ └──────┬───────┘ └──────┬───────┘ └──────┬───────┘ └────┬─────┘  │
+│         │                │                │                │              │        │
+│         └────────────────┴────────────────┴────────────────┴──────────────┘        │
+│                                    统一 Tool 接口                                   │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+                                        │
+                                        ▼
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                              基础设施层 (Infrastructure)                              │
+│  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐      │
+│  │ 权限系统 │ │ 压缩系统 │ │ 记忆系统 │ │ 成本追踪 │ │ 可观测性 │ │ 桥接层   │      │
+│  │5层安全   │ │AutoCompact│ │Memory   │ │CostTrack │ │OpenTelemetry│ │Remote  │      │
+│  └──────────┘ └──────────┘ └──────────┘ └──────────┘ └──────────┘ └──────────┘      │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 2.2 模块依赖与数据流图
+
+```
+┌────────────────────────────────────────────────────────────────────────────────────┐
+│                           数据流向图 (Data Flow)                                     │
+└────────────────────────────────────────────────────────────────────────────────────┘
+
+    用户输入
+        │
+        ▼
+┌───────────────┐    解析命令    ┌───────────────┐
+│  entrypoints/ │───────────────▶│   commands/   │
+│   cli.tsx     │                │  斜杠命令     │
+└───────┬───────┘                └───────┬───────┘
+        │                                │
+        │ 自然语言输入                   │ 命令执行
+        ▼                                ▼
+┌───────────────┐                ┌───────────────┐
+│     state/    │◀───────────────│   hooks/      │
+│  AppState.tsx │   状态更新      │  useSettings  │
+└───────┬───────┘                └───────────────┘
+        │
+        │ getState() / setState()
+        ▼
+┌───────────────┐    调度查询     ┌───────────────┐
+│  QueryEngine  │────────────────▶│    query.ts   │
+│    .ts        │                │  Agent循环    │
+└───────────────┘                └───────┬───────┘
+                                         │
+                    ┌────────────────────┼────────────────────┐
+                    │                    │                    │
+                    ▼                    ▼                    ▼
+           ┌──────────────┐    ┌──────────────┐    ┌──────────────┐
+           │  services/   │    │   utils/     │    │   types/     │
+           │ API调用层    │    │ 工具函数     │    │ 类型定义     │
+           └──────┬───────┘    └──────┬───────┘    └──────────────┘
+                  │                   │
+                  ▼                   ▼
+           ┌──────────────┐    ┌──────────────┐
+           │ services/api/│    │services/tools│
+           │  anthropic   │    │StreamingTool │
+           │  流式API     │    │Executor      │
+           └──────┬───────┘    └──────┬───────┘
+                  │                   │
+                  │    工具调用请求   │
+                  └──────────────────▶│
+                                      │
+                    ┌─────────────────┼─────────────────┐
+                    │                 │                 │
+                    ▼                 ▼                 ▼
+            ┌───────────┐     ┌───────────┐     ┌───────────┐
+            │  tools/   │     │ services/ │     │   tasks/  │
+            │ 43个工具  │     │   mcp/    │     │ 后台任务  │
+            │ 具体实现  │     │外部MCP服务│     │ 执行引擎  │
+            └───────────┘     └───────────┘     └───────────┘
+```
+
+### 2.3 核心模块能力矩阵
+
+| 模块 | 核心能力 | 技术特点 | 交互方式 |
+|------|---------|----------|----------|
+| **entrypoints/cli.tsx** | CLI入口、参数解析、快速路径 | Bun特性系统、动态导入 | 命令行参数、环境变量 |
+| **QueryEngine.ts** | 会话配置、Agent生命周期管理 | 配置驱动、依赖注入 | 回调函数、配置对象 |
+| **query.ts** | PDAOL循环、流式处理、错误恢复 | AsyncGenerator、背压控制 | yield产出、signal取消 |
+| **StreamingToolExecutor** | 并行执行、并发控制、进度流 | 状态机、Promise.all | 迭代器模式、事件回调 |
+| **Tool.ts** | 统一工具接口、类型系统 | Zod校验、泛型设计 | call/prompt/render三元组 |
+| **AppState.tsx** | React状态树、跨组件通信 | useSyncExternalStore | setState/getState API |
+| **bootstrap/state.ts** | 全局单例、跨会话持久 | Signal信号系统 | 直接状态访问 |
+| **services/mcp/** | MCP客户端、工具动态注册 | 进程隔离、协议转换 | stdio/HTTP传输 |
+| **services/compact/** | 上下文压缩、熔断机制 | AI摘要、安全边界 | 自动触发/手动触发 |
+| **utils/permissions/** | 5层权限、命令安全分析 | 策略模式、正则匹配 | Promise<PermissionResult> |
+
+### 2.4 模块交互详细说明
+
+#### 2.4.1 工具调用交互流程
+
+```
+┌──────────┐     ┌──────────┐     ┌──────────┐     ┌──────────┐     ┌──────────┐
+│  Claude  │────▶│ query.ts │────▶│Streaming │────▶│   Tool   │────▶│ 具体工具  │
+│   API    │     │          │     │ToolExec  │     │  接口    │     │ 实现     │
+└──────────┘     └──────────┘     └──────────┘     └──────────┘     └──────────┘
+     │                                  │                 │                 │
+     │ 1. 返回tool_use块                │                 │                 │
+     │─────────────────────────────────▶│                 │                 │
+     │                                  │ 2. 解析并创建   │                 │
+     │                                  │    执行计划     │                 │
+     │                                  │────────────────▶│                 │
+     │                                  │                 │ 3. 权限检查     │
+     │                                  │                 │    validate     │
+     │                                  │                 │────────────────▶│
+     │                                  │                 │                 │ 4. 执行
+     │                                  │                 │                 │    操作
+     │                                  │                 │◀────────────────│
+     │                                  │                 │ 5. 返回结果     │
+     │                                  │◀────────────────│                 │
+     │                                  │ 6. 产出tool_result                │
+     │◀─────────────────────────────────│                 │                 │
+     │ 7. 继续生成或完成                │                 │                 │
+```
+
+**交互说明：**
+- **① API响应流式解析**：`query.ts`通过`AsyncGenerator`消费API流，实时检测`tool_use`块
+- **② 执行器调度**：`StreamingToolExecutor`根据工具类型决定并行或串行执行
+- **③ 权限检查**：`Tool.call()`首先调用`validateInput()`和`checkPermissions()`
+- **④ 具体执行**：工具实现执行实际操作（文件读写、命令执行等）
+- **⑤ 结果包装**：返回`ToolResult<T>`，包含数据和可能的上下文修改器
+- **⑥ 消息组装**：`mapToolResultToToolResultBlockParam()`转换为API消息格式
+- **⑦ 循环继续**：结果追加到消息历史，继续Agent循环
+
+#### 2.4.2 状态管理交互流程
+
+```
+┌────────────────────────────────────────────────────────────────────────────────┐
+│                           状态管理交互图                                         │
+└────────────────────────────────────────────────────────────────────────────────┘
+
+  本地组件                          状态层                           全局层
+┌─────────────┐               ┌───────────────┐               ┌───────────────┐
+│  Message.tsx │               │  AppState.tsx │               │bootstrap/state│
+│   (UI组件)   │               │  (React状态)  │               │   (全局单例)   │
+└──────┬──────┘               └───────┬───────┘               └───────┬───────┘
+       │                              │                               │
+       │ ① useAppState(selector)      │                               │
+       │─────────────────────────────▶│                               │
+       │                              │                               │
+       │◀──────────状态切片───────────│                               │
+       │                              │                               │
+       │ ② 用户交互                    │                               │
+       │  (点击/输入)                  │                               │
+       │─────────────────────────────▶│                               │
+       │                              │ ③ setState(updater)           │
+       │                              │ (函数式更新)                   │
+       │                              ├───────────────────────────────▶│
+       │                              │                               │
+       │                              │ ④ 持久化操作                   │
+       │                              │◀───────────────────────────────│
+       │                              │ (累计费用等)                   │
+       │                              │                               │
+       │◀──────────⑤ 重渲染───────────│                               │
+       │   (订阅者通知)                │                               │
+       │                              │                               │
+```
+
+**交互说明：**
+- **① 状态订阅**：UI组件通过`useAppState(selector)`订阅状态切片，使用`useSyncExternalStore`与React并发特性兼容
+- **② 用户交互**：用户操作触发事件处理函数
+- **③ 函数式更新**：`setState(prev => ({...prev, ...newState}))`保证更新原子性
+- **④ 跨层同步**：Bootstrap State通过Signal机制通知订阅者
+- **⑤ 选择性重渲染**：只有依赖变化的分支组件会重渲染
+
+#### 2.4.3 MCP协议交互流程
+
+```
+┌─────────────┐     ┌─────────────┐     ┌─────────────┐     ┌─────────────┐
+│  用户配置   │────▶│  MCPClient  │────▶│ MCPTransport│────▶│ MCP Server  │
+│settings.json│     │   (初始化)   │     │(stdio/http) │     │(外部进程)   │
+└─────────────┘     └──────┬──────┘     └─────────────┘     └──────┬──────┘
+                           │                                        │
+                           │ ① 读取配置                            │
+                           │ ② 启动进程/连接                       │
+                           │ ③ capability协商                      │
+                           │◀─────────────────────────────────────▶│
+                           │                                        │
+                           │ ④ listTools()                        │
+                           │◀──────────────────────────────────────│
+                           │                                        │
+┌─────────────┐     ┌──────┴──────┐     ┌─────────────┐     ┌─────────────┐
+│ Claude使用  │◀────│  wrapMCPTool │◀────│ Tool注册中心 │◀────│ 工具调用    │
+│  MCP工具    │     │ (动态包装)   │     │  tools数组   │     │ callTool()  │
+└─────────────┘     └─────────────┘     └─────────────┘     └─────────────┘
+```
+
+**交互说明：**
+- **① 配置读取**：从`~/.claude/settings.json`读取MCP服务器配置
+- **② 进程启动**：`StdioTransport`启动子进程，`HTTPTransport`建立HTTP连接
+- **③ 能力协商**：MCP协议握手，确定支持的协议版本和功能
+- **④ 工具发现**：调用`tools/list`获取服务器提供的工具列表
+- **⑤ 动态包装**：每个MCP工具通过`wrapMCPTool()`包装为标准`Tool`接口
+- **⑥ 统一调用**：Claude通过标准`Tool.call()`调用，透明转换为MCP协议消息
+
+### 2.5 图例说明
+
+#### 颜色图例（架构图中）
+
+| 颜色 | 含义 | 对应模块类型 |
+|------|------|-------------|
+| 🟦 蓝色 | 用户交互层 | entrypoints, components, hooks |
+| 🟩 绿色 | 状态管理层 | state, context |
+| 🟨 黄色 | 核心引擎层 | QueryEngine, query, services/tools |
+| 🟧 橙色 | 能力层 | tools, services/mcp, tasks |
+| 🟪 紫色 | 基础设施层 | utils, services/compact, bootstrap |
+| ⬜ 灰色 | 外部系统 | Claude API, MCP Servers, LSP |
+
+#### 箭头图例（交互图中）
+
+| 符号 | 含义 | 示例 |
+|------|------|------|
+| ───▶ | 同步调用 | 函数调用、方法执行 |
+| ──▶│ | 异步调用 | Promise、async/await |
+| ═══▶ | 流式数据 | ReadableStream、AsyncGenerator |
+| ◀──▶ | 双向通信 | WebSocket、请求-响应 |
+| ──●  | 事件监听 | EventEmitter、回调注册 |
+
+#### 模块形状图例
+
+| 形状 | 含义 | 示例 |
+|------|------|------|
+| ┌─┐ 矩形 | 标准模块/类 | Tool.ts, query.ts |
+| ┌┬┐ 分层矩形 | 分层架构 | AppState层、Service层 |
+| ◇ 菱形 | 决策/路由 | 权限检查、并发控制 |
+| ○ 圆形 | 数据存储 | FileStateCache、Bootstrap State |
+| □ 虚线框 | 可选/条件模块 | VoiceMode、Coordinator |
+
+#### 2.4.4 自动压缩系统交互流程
+
+```
+┌─────────────┐     ┌─────────────┐     ┌─────────────┐     ┌─────────────┐
+│  Token计数  │────▶│AutoCompact  │────▶│ Compact边界 │────▶│ Claude API  │
+│  超过阈值   │     │  触发判断   │     │   检测      │     │  生成摘要   │
+└─────────────┘     └──────┬──────┘     └─────────────┘     └──────┬──────┘
+                           │                                        │
+                           │ ① 计算当前token数                     │
+                           │     getAutoCompactThreshold()          │
+                           │───────────────────────────────────────▶│
+                           │                                        │
+                           │ ② 如果超过阈值                        │
+                           │    (contextWindow - 13000)            │
+                           │◀───────────────────────────────────────│
+                           │                                        │
+                           │ ③ 寻找安全边界                        │
+                           │    (保留最近N条消息)                  │
+                           ├───────────────────────────────────────▶│
+                           │                                        │
+                           │ ④ 调用压缩API                         │
+                           │    compactConversation()              │
+                           ├───────────────────────────────────────▶│
+                           │                                        │
+                           │ ⑤ 返回摘要消息                        │
+                           │◀───────────────────────────────────────│
+                           │                                        │
+┌─────────────┐     ┌──────┴──────┐     ┌─────────────┐            │
+│  继续对话   │◀────│ 替换历史消息 │◀────│ 更新message │◀───────────┘
+│             │     │ buildPostCompact│  │ 数组状态    │
+└─────────────┘     └─────────────┘     └─────────────┘
+```
+
+**交互说明：**
+- **① 阈值计算**：`getAutoCompactThreshold()`根据模型上下文窗口计算触发阈值（默认85%）
+- **② 触发判断**：`calculateTokenWarningState()`返回`isAboveAutoCompactThreshold`
+- **③ 边界检测**：`findCompactBoundary()`确保不在工具调用中间压缩
+- **④ 摘要生成**：调用Claude API生成对话历史摘要，保留关键决策和代码变更
+- **⑤ 状态更新**：用摘要消息替换详细历史，更新`AppState.messages`
+- **⑥ 熔断保护**：`MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES`防止无限压缩循环
+
+#### 2.4.5 权限系统交互流程
+
+```
+┌─────────────┐     ┌─────────────┐     ┌─────────────┐     ┌─────────────┐
+│  工具调用   │────▶│ validateInput│────▶│checkPermissions│────▶│ 权限决策    │
+│   请求      │     │  (格式校验)  │     │  (策略检查)  │     │  路由       │
+└─────────────┘     └──────┬──────┘     └──────┬──────┘     └──────┬──────┘
+                           │                   │                   │
+                           │ ① Zod schema     │ ② 检查allow/deny  │ ③ 决策结果
+                           │    校验           │    规则           │
+                           │                   │                   │
+                           ▼                   ▼                   ▼
+                   ┌───────────────┐  ┌───────────────┐  ┌───────────────┐
+                   │  ValidationError│ │ 规则匹配结果   │  │   'allow'     │
+                   │  (返回错误)    │  │ (永远允许/拒绝)│  │   'deny'      │
+                   └───────────────┘  └───────────────┘  │   'ask'       │
+                                                         └───────┬───────┘
+                                                                 │
+                                    ┌─────────────────────────────┼─────────────────────────────┐
+                                    │                             │                             │
+                                    ▼                             ▼                             ▼
+                            ┌───────────────┐           ┌───────────────┐           ┌───────────────┐
+                            │  直接执行     │           │  拒绝并返回   │           │  显示权限     │
+                            │  (允许)       │           │  错误消息     │           │  确认对话框   │
+                            └───────────────┘           └───────────────┘           └───────┬───────┘
+                                                                                            │
+                                                                                    用户响应 │
+                                                                                            ▼
+                                                                                  ┌───────────────┐
+                                                                                  │  'always_allow'│
+                                                                                  │  'allow_once'  │
+                                                                                  │  'deny'        │
+                                                                                  │  'deny_with_reason'│
+                                                                                  └───────┬───────┘
+                                                                                          │
+                                                                            ┌─────────────┼─────────────┐
+                                                                            ▼             ▼             ▼
+                                                                      ┌────────┐   ┌────────┐   ┌────────┐
+                                                                      │更新allow│   │执行一次 │   │记录denial│
+                                                                      │规则     │   │执行    │   │追踪     │
+                                                                      └────────┘   └────────┘   └────────┘
+```
+
+**交互说明：**
+- **① 输入校验**：Zod schema验证输入格式，`validateInput()`返回`{result, message, errorCode}`
+- **② 权限规则检查**：按优先级检查`alwaysAllowRules`、`alwaysDenyRules`、`alwaysAskRules`
+- **③ 决策路由**：
+  - `'allow'`：直接执行工具
+  - `'deny'`：返回拒绝错误，可能触发`denialTracking`计数
+  - `'ask'`：显示权限对话框，等待用户决策
+- **④ 用户选择**：
+  - `allow_once`：仅允许本次执行
+  - `always_allow`：添加到`alwaysAllowRules`，后续自动允许
+  - `deny`：拒绝并记录，连续3次拒绝后降级到提示模式
+  - `deny_with_reason`：拒绝并附带原因，Claude可根据反馈调整策略
+
+#### 2.4.6 多代理系统交互流程
+
+```
+┌─────────────┐     ┌─────────────┐     ┌─────────────┐     ┌─────────────┐
+│  父Agent    │────▶│ AgentTool   │────▶│ 创建子Agent  │────▶│ 独立QueryEngine│
+│  调用AgentTool│    │  (分析请求) │     │ (隔离上下文) │     │  (PDAOL循环)  │
+└─────────────┘     └──────┬──────┘     └──────┬──────┘     └──────┬──────┘
+                           │                   │                   │
+                           │ ① 解析subagent_type│ ② 分配颜色        │ ③ 独立执行
+                           │    和prompt       │    agentColor     │    工具调用
+                           │                   │                   │
+                           ▼                   ▼                   ▼
+                   ┌───────────────┐  ┌───────────────┐  ┌───────────────┐
+                   │  选择Agent定义 │  │ 创建ToolUseContext│ │  执行43个工具  │
+                   │  (Explore/Plan)│  │ (隔离权限/状态)  │ │  中可用子集    │
+                   └───────┬───────┘  └───────┬───────┘  └───────┬───────┘
+                           │                   │                   │
+                           │                   │                   │ 完成/失败
+                           │                   │                   ▼
+                           │                   │          ┌───────────────┐
+                           │                   │          │  结果格式化    │
+                           │                   │          │  (颜色标记)    │
+                           │                   │          └───────┬───────┘
+                           │                   │                  │
+                           └───────────────────┴──────────────────┘
+                                               │
+                                               ▼
+                                       ┌───────────────┐
+                                       │  返回父Agent   │
+                                       │  (追加到消息历史)│
+                                       └───────────────┘
+```
+
+**交互说明：**
+- **① Agent类型选择**：根据`subagent_type`选择预定义配置（`Explore`只读、`Plan`只规划等）
+- **② 颜色分配**：`agentColorManager`为新代理分配唯一颜色，用于UI区分
+- **③ 上下文隔离**：创建独立的`ToolUseContext`，可选继承或重置权限状态
+- **④ 执行模式**：
+  - `run_in_background: false`：同步等待结果
+  - `run_in_background: true`：返回任务ID，异步执行
+  - `isolation: 'worktree'`：在独立Git worktree中运行
+- **⑤ 结果汇报**：子代理完成后，结果以带颜色标记的消息返回父代理
+
+---
+
+### 2.7 源码目录结构详解
+
+Claude Code 的源码组织体现了清晰的分层架构思想：
+
+```
+restored-src/src/
+├── entrypoints/           # 入口点（CLI、SDK、Daemon）
+│   ├── cli.tsx           # 主 CLI 入口（包含 Bun 特性系统初始化）
+│   ├── agentSdkTypes.ts  # SDK 类型定义
+│   └── ...
+├── QueryEngine.ts        # 查询引擎核心配置
+├── query.ts              # Agent 循环主实现（1729 行）
+├── Tool.ts               # 工具系统类型与接口定义
+├── Task.ts               # 任务类型定义
+├── commands.ts           # 斜杠命令注册中心
+├── cost-tracker.ts       # 成本追踪
+├── bootstrap/            # 启动层
+│   └── state.ts          # 全局 Bootstrap State（跨会话持久状态）
+├── state/                # 状态管理层
+│   ├── AppState.tsx      # React 状态树 Provider
+│   ├── AppStateStore.ts  # AppState 类型定义与默认状态
+│   └── store.ts          # 轻量级状态存储实现
+├── tools/                # 工具系统（43 个工具各有一个目录）
+│   ├── AgentTool/        # 多代理子系统
+│   ├── BashTool/         # Shell 执行
+│   ├── FileReadTool/     # 文件读取
+│   ├── FileEditTool/     # 文件编辑
+│   ├── FileWriteTool/    # 文件写入
+│   ├── GrepTool/         # 内容搜索（ripgrep 包装）
+│   ├── GlobTool/         # 文件匹配
+│   ├── LSPTool/          # LSP 集成
+│   ├── MCPTool/          # MCP 协议集成
+│   ├── TaskCreateTool/   # 任务管理
+│   └── ...（共 43+ 个工具）
+├── services/             # 核心服务层
+│   ├── mcp/              # MCP 客户端实现
+│   ├── compact/          # 自动压缩算法
+│   ├── tools/            # 工具执行编排
+│   │   ├── StreamingToolExecutor.ts  # 流式工具执行器
+│   │   ├── toolExecution.ts          # 单工具执行逻辑
+│   │   └── toolOrchestration.ts      # 工具编排
+│   └── api/              # API 调用层
+├── components/           # TUI 组件（Ink/React）
+│   ├── App.tsx           # 主应用组件
+│   ├── Message.tsx       # 消息渲染
+│   ├── Messages.tsx      # 消息列表
+│   └── ...（50+ 个组件）
+├── context/              # React Context
+├── hooks/                # React Hooks
+├── utils/                # 工具函数
+│   ├── permissions/      # 权限系统五层实现
+│   ├── fileStateCache.ts # 文件读取缓存
+│   └── ...
+├── ink/                  # Ink TUI 框架扩展
+├── bridge/               # 桥接层（远程会话支持）
+├── tasks/                # 任务执行（本地/远程代理）
+├── types/                # 类型定义（含 Protobuf 生成）
+├── constants/            # 常量定义
+├── assistant/            # 助手功能
+├── buddy/                # 吉祥物动画
+├── coordinator/          # 协调器模式
+├── vim/                  # Vim 模式支持
+├── plugins/              # 插件系统
+└── commands/             # 斜杠命令实现（40+ 个）
+    ├── commit.ts
+    ├── cost.ts
+    ├── files.ts
+    └── ...
+```
+
+### 2.2 模块依赖关系
+
+```
+entrypoints/cli.tsx
+    ↓
+bootstrap/state.ts (全局状态初始化)
+    ↓
+state/AppState.tsx (React 状态树)
+    ↓
+QueryEngine.ts → query.ts (Agent 循环)
+    ↓
+services/tools/* (工具执行层)
+    ↓
+tools/* (43 个具体工具)
+```
+
+关键设计：**Bootstrap State 与 AppState 的双层架构**
+
+```typescript
+// Bootstrap State - 全局单例，跨会话持久
+// src/bootstrap/state.ts
+export type State = {
+  originalCwd: string
+  projectRoot: string
+  totalCostUSD: number          // 累计费用
+  totalAPIDuration: number      // API 调用时长
+  modelUsage: { [modelName: string]: ModelUsage }
+  sessionId: SessionId
+  // ... 严格控制的少量全局状态
+}
+
+// 代码中的警示注释：
+// DO NOT ADD MORE STATE HERE - BE JUDICIOUS WITH GLOBAL STATE
+// （不要在这里添加更多状态——对全局状态要谨慎）
+```
+
+```typescript
+// AppState - 会话级 React 状态树
+// src/state/AppStateStore.ts
+export type AppState = {
+  messages: Message[]           // 对话消息
+  tasks: Task[]                 // 任务列表
+  permissionRequests: PermissionRequest[]
+  isInToolConfirmationDialog: boolean
+  // ... 会话级状态
+}
+```
+
+---
+
+## 三、核心 Agent 循环：PDAOL 范式深度解析
+
+### 3.1 query.ts：Agent 循环的核心实现
+
+`query.ts` 文件（1729 行）是整个 Claude Code 最核心的模块，实现了**PDAOL 范式**（Perceive-Decide-Act-Observe-Loop）：
+
+```typescript
+// 简化版 Agent 循环流程
+export async function* query(params: QueryParams): AsyncGenerator<...> {
+  // 1. [感知] 构建系统提示
+  const systemPrompt = buildSystemPrompt(...)
+
+  // 2. [决策] 调用 Claude API 获取响应流
+  const stream = await anthropic.messages.stream({
+    model, messages, systemPrompt, tools,
+    stream: true,  // 流式处理
+  })
+
+  // 3. [行动] 流式执行工具调用
+  for await (const chunk of stream) {
+    if (chunk.type === 'tool_use') {
+      // 并行执行工具（通过 StreamingToolExecutor）
+      const executor = new StreamingToolExecutor(tools, canUseTool, context)
+      executor.addTool(chunk, assistantMessage)
+
+      // 4. [观察] 实时产出工具结果
+      for await (const result of executor.getRemainingResults()) {
+        yield result.message  // 实时反馈给用户
+      }
+    }
+
+    yield chunk  // 实时流式输出
+  }
+
+  // 5. [循环] 检查是否需要继续
+  if (hasMoreToolCalls(messages)) {
+    yield* query({ ...params, messages })  // 递归继续
+  }
+}
+```
+
+### 3.2 流式处理架构：AsyncGenerator 与背压
+
+Claude Code 使用 JavaScript 的 `AsyncGenerator` 实现自然的背压机制：
+
+```typescript
+// 流式 API 调用实现
+const stream = await anthropic.messages.stream({
+  model: 'claude-sonnet-4-6',
+  messages,
+  stream: true,
+})
+
+// 使用 async generator 处理流
+for await (const chunk of stream) {
+  // 实时处理每个 chunk，自动实现背压
+  // 如果消费端处理慢，stream 会自动减速
+  yield chunk
+}
+```
+
+**背压（Backpressure）机制**：当 UI 渲染跟不上 API 输出速度时，`for await` 循环会自然放慢消费速度，避免内存无限增长。
+
+### 3.3 Token 预算系统：双维度限制
+
+```typescript
+// src/QueryEngine.ts
+export type QueryEngineConfig = {
+  maxTurns?: number           // 最大轮次（防止无限循环）
+  maxBudgetUsd?: number       // 最大费用（美元）
+  taskBudget?: { total: number }  // Token 预算
+}
+
+// query.ts 中的预算检查
+function* checkBudget(...) {
+  const budget = createBudgetTracker(taskBudget)
+
+  if (checkTokenBudget(budget, usage)) {
+    // 超出预算，优雅停止
+    yield createBudgetExceededMessage(...)
+    return
+  }
+}
+```
+
+---
+
+## 四、StreamingToolExecutor：流式工具执行器
+
+### 4.1 设计目标
+
+`StreamingToolExecutor`（`src/services/tools/StreamingToolExecutor.ts`，531 行）是 Claude Code 的核心创新之一，解决以下问题：
+
+1. **并行工具执行**：多个工具调用并行处理，提高效率
+2. **并发安全控制**：某些工具（如文件编辑）需要独占执行
+3. **实时进度反馈**：工具执行进度实时显示给用户
+4. **错误级联处理**：一个工具失败时，取消相关兄弟工具
+
+### 4.2 核心实现
+
+```typescript
+export class StreamingToolExecutor {
+  private tools: TrackedTool[] = []
+  private siblingAbortController: AbortController
+
+  // 工具状态机
+  type ToolStatus = 'queued' | 'executing' | 'completed' | 'yielded'
+
+  type TrackedTool = {
+    id: string
+    block: ToolUseBlock
+    status: ToolStatus
+    isConcurrencySafe: boolean  // 是否可并发执行
+    promise?: Promise<void>
+    pendingProgress: Message[]  // 待发送的进度消息
+  }
+}
+```
+
+### 4.3 并发控制策略
+
+```typescript
+/**
+ * 检查工具是否可以执行
+ * - 并发安全工具可以与其它并发安全工具并行
+ * - 非并发工具必须独占执行
+ */
+private canExecuteTool(isConcurrencySafe: boolean): boolean {
+  const executingTools = this.tools.filter(t => t.status === 'executing')
+  return (
+    executingTools.length === 0 ||
+    (isConcurrencySafe && executingTools.every(t => t.isConcurrencySafe))
+  )
+}
+```
+
+### 4.4 实时进度流
+
+```typescript
+// 进度消息立即产出
+if (update.message?.type === 'progress') {
+  tool.pendingProgress.push(update.message)
+  // 唤醒等待的 consumer
+  if (this.progressAvailableResolve) {
+    this.progressAvailableResolve()
+  }
+}
+
+// Consumer 端
+async *getRemainingResults(): AsyncGenerator<MessageUpdate> {
+  while (this.hasUnfinishedTools()) {
+    // 产出已完成的工具结果
+    for (const result of this.getCompletedResults()) {
+      yield result
+    }
+
+    // 等待新进度或工具完成
+    await Promise.race([
+      ...executingPromises,
+      progressPromise  // 进度可用时唤醒
+    ])
+  }
+}
+```
+
+### 4.5 错误级联处理
+
+```typescript
+// Bash 命令错误时取消兄弟进程
+if (tool.block.name === BASH_TOOL_NAME && isErrorResult) {
+  this.hasErrored = true
+  this.siblingAbortController.abort('sibling_error')
+  // 这会触发所有正在执行的 Bash 工具的 AbortSignal
+}
+```
+
+---
+
+## 五、Auto-Compact：上下文自动压缩系统
+
+### 5.1 问题背景
+
+LLM 的上下文窗口有限（如 200K tokens），长对话会超出限制。Claude Code 的 Auto-Compact 系统是**用 AI 管理 AI 记忆**的工程实践。
+
+### 5.2 压缩触发机制
+
+```typescript
+// src/services/compact/autoCompact.ts
+
+// 阈值配置（预留安全边距）
+export const AUTOCOMPACT_BUFFER_TOKENS = 13_000
+export const WARNING_THRESHOLD_BUFFER_TOKENS = 20_000
+
+// 计算有效上下文窗口
+export function getEffectiveContextWindowSize(model: string): number {
+  const contextWindow = getContextWindowForModel(model, getSdkBetas())
+  const reservedTokensForSummary = 20_000  // 为摘要预留
+  return contextWindow - reservedTokensForSummary
+}
+
+// 自动压缩阈值（默认 85% 触发）
+export function getAutoCompactThreshold(model: string): number {
+  const effectiveContextWindow = getEffectiveContextWindowSize(model)
+  return effectiveContextWindow - AUTOCOMPACT_BUFFER_TOKENS
+}
+```
+
+### 5.3 压缩算法流程
+
+```
+检测到 Token 使用率超过 85%
+    ↓
+寻找安全压缩边界（保留最近 N 条消息）
+    ↓
+调用 Claude API 生成对话历史摘要
+    ↓
+用摘要替换详细历史
+    ↓
+继续对话
+```
+
+### 5.4 安全边界检测
+
+```typescript
+// 寻找安全的压缩边界
+function findCompactBoundary(messages: Message[]): number {
+  // 从后往前遍历，找到可以安全截断的位置
+  // 不能截断在工具调用中间（必须有配对的 tool_use 和 tool_result）
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (isSafeCompactPoint(messages[i])) {
+      return i
+    }
+  }
+  return 0
+}
+```
+
+### 5.5 熔断机制
+
+```typescript
+// 防止无限压缩循环
+const MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES = 3
+
+if (consecutiveFailures >= MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES) {
+  // 停止尝试，优雅降级
+  return { type: 'compact_failed', reason: 'circuit_breaker' }
+}
+```
+
+---
+
+## 六、Bun 特性系统：条件编译与死代码消除
+
+### 6.1 Bun 运行时优势
+
+Claude Code 使用 Bun 而非 Node.js，获得显著性能提升：
+
+| 维度 | Node.js | Bun |
+|------|---------|-----|
+| 启动时间 | ~100ms | ~10ms |
+| 模块加载 | 慢（CommonJS） | 快（原生 ESM） |
+| TypeScript | 需要编译 | 原生支持 |
+| 包管理 | npm（慢） | bun（快 10-25x） |
+
+### 6.2 bun:bundle 特性系统
+
+`bun:bundle` 提供了编译时特性标志，实现死代码消除（Dead Code Elimination）：
+
+```typescript
+// src/entrypoints/cli.tsx
+import { feature } from 'bun:bundle'
+
+// 只有在启用 VOICE_MODE 时才包含语音相关代码
+const VoiceProvider = feature('VOICE_MODE')
+  ? require('../context/voice.js').VoiceProvider
+  : ({ children }) => children  // 空实现
+
+// 只有在启用 COORDINATOR_MODE 时才包含协调器代码
+const getCoordinatorUserContext = feature('COORDINATOR_MODE')
+  ? require('./coordinator/coordinatorMode.js').getCoordinatorUserContext
+  : () => ({})
+```
+
+**构建时行为**：未启用的 feature 对应的代码会被完全删除，减小 bundle 大小。
+
+### 6.3 MACRO 替换
+
+Bun 支持编译时宏替换：
+
+```typescript
+// 在入口点
+console.log(`${MACRO.VERSION} (Claude Code)`)
+
+// 构建时被替换为实际版本号
+console.log(`2.1.88 (Claude Code)`)
+```
+
+### 6.4 快速路径优化
+
+```typescript
+// 对于简单命令（--version、--help）跳过完整初始化
+if (args.length === 1 && args[0] === '--version') {
+  console.log(`${MACRO.VERSION} (Claude Code)`)
+  return  // 不加载任何模块
+}
+```
+
+---
+
+## 七、工具系统：原子能力与 AI 编排
+
+### 7.1 工具接口设计
+
+`Tool.ts`（793 行）定义了统一的工具接口：
+
+```typescript
+export type Tool<Input extends AnyObject, Output, P extends ToolProgressData> = {
+  name: string              // 工具名称
+  aliases?: string[]        // 别名（向后兼容）
+  searchHint?: string       // 工具搜索关键词
+  description: string       // 给 AI 看的描述
+  inputSchema: Input        // Zod 输入校验模式
+
+  // 核心执行函数
+  call(
+    args: z.infer<Input>,
+    context: ToolUseContext,
+    canUseTool: CanUseToolFn,
+    parentMessage: AssistantMessage,
+    onProgress?: ToolCallProgress<P>,
+  ): Promise<ToolResult<Output>>
+
+  // 并发控制
+  isConcurrencySafe(input: z.infer<Input>): boolean
+
+  // 权限控制
+  isReadOnly(input: z.infer<Input>): boolean
+  isDestructive?(input: z.infer<Input>): boolean
+  checkPermissions(input, context): Promise<PermissionResult>
+
+  // 中断行为
+  interruptBehavior?(): 'cancel' | 'block'
+
+  // UI 渲染
+  renderToolUseMessage(input, options): React.ReactNode
+  renderToolResultMessage(content, progress, options): React.ReactNode
+  renderToolUseProgressMessage(progress, options): React.ReactNode
+
+  // 延迟加载（ToolSearch 优化）
+  shouldDefer?: boolean
+  alwaysLoad?: boolean
+
+  // 结果大小限制
+  maxResultSizeChars: number
+}
+```
+
+### 7.2 buildTool：默认行为封装
+
+```typescript
+// 工具默认行为
+const TOOL_DEFAULTS = {
+  isEnabled: () => true,
+  isConcurrencySafe: () => false,      // 默认不安全，需显式声明
+  isReadOnly: () => false,             // 默认非只读
+  isDestructive: () => false,          // 默认非破坏性
+  checkPermissions: () => Promise.resolve({ behavior: 'allow' }),
+  toAutoClassifierInput: () => '',     // 跳过自动分类器
+  userFacingName: () => '',
+}
+
+// 创建工具的工厂函数
+export function buildTool<D extends AnyToolDef>(def: D): BuiltTool<D> {
+  return {
+    ...TOOL_DEFAULTS,
+    userFacingName: () => def.name,
+    ...def,
+  } as BuiltTool<D>
+}
+```
+
+### 7.3 43 个内置工具分类
+
+| 类别 | 工具 | 功能 |
+|------|------|------|
+| **文件操作** | FileReadTool, FileEditTool, FileWriteTool, GlobTool | 文件读写与搜索 |
+| **Shell 执行** | BashTool, PowerShellTool | 命令执行 |
+| **代码智能** | LSPTool | LSP 集成 |
+| **任务管理** | TaskCreateTool, TaskUpdateTool, TaskGetTool, TaskListTool, TaskStopTool | 后台任务 |
+| **多代理** | AgentTool, TeamCreateTool, SendMessageTool | 子代理协作 |
+| **计划模式** | EnterPlanModeTool, ExitPlanModeTool | 规划模式 |
+| **MCP 集成** | MCPTool, ListMcpResourcesTool, ReadMcpResourceTool | 外部工具 |
+| **其他** | WebSearchTool, WebFetchTool, TodoWriteTool, SleepTool 等 | 扩展能力 |
+
+### 7.4 工具执行流程
+
+```
+Claude 请求工具调用
+    ↓
+validateInput() - 输入校验
+    ↓
+checkPermissions() - 权限检查
+    ↓
+[如果需要] 显示权限确认对话框
+    ↓
+执行工具 call()
+    ↓
+onProgress() 回调 - 实时进度
+    ↓
+返回 ToolResult
+    ↓
+renderToolResultMessage() - 渲染结果
+```
+
+---
+
+## 八、权限系统：五层分层架构
+
+### 8.1 架构概览
+
+```
+层次 1：模式级别（bypassPermissions / default / plan）
+    ↓
+层次 2：工具级别（某些工具默认允许，某些默认询问）
+    ↓
+层次 3：操作级别（同一工具的不同操作有不同权限）
+    ↓
+层次 4：路径级别（文件操作的路径范围限制）
+    ↓
+层次 5：命令级别（Shell 命令的安全分析）
+```
+
+### 8.2 ToolPermissionContext
+
+```typescript
+export type ToolPermissionContext = DeepImmutable<{
+  mode: PermissionMode                    // 当前权限模式
+  additionalWorkingDirectories: Map<string, AdditionalWorkingDirectory>
+  alwaysAllowRules: ToolPermissionRulesBySource   // 始终允许规则
+  alwaysDenyRules: ToolPermissionRulesBySource    // 始终拒绝规则
+  alwaysAskRules: ToolPermissionRulesBySource     // 始终询问规则
+  isBypassPermissionsModeAvailable: boolean       // 是否可跳过权限
+  shouldAvoidPermissionPrompts?: boolean          // 后台代理不显示 UI
+}>
+```
+
+### 8.3 权限检查结果
+
+```typescript
+export type PermissionResult =
+  | { behavior: 'allow'; updatedInput: unknown }    // 允许
+  | { behavior: 'deny'; reason: string }            // 拒绝
+  | {
+      behavior: 'ask'                               // 询问用户
+      message: string                               // 询问消息
+      rule?: PermissionRule                         // 关联规则
+    }
+```
+
+### 8.4 BashTool 命令安全分析
+
+```typescript
+// 危险命令模式检测
+const DANGEROUS_PATTERNS = [
+  /rm\s+-rf\s+\//,           // rm -rf /
+  />\s*\/dev\/\w+/,          // 覆写磁盘设备
+  /curl.*\|.*sh/,            // 管道执行远程脚本
+  /wget.*\|.*sh/,
+  /mkfs\./,                  // 格式化文件系统
+  /dd\s+if=/,                // 磁盘写入
+]
+
+function analyzeCommandSafety(command: string): SafetyLevel {
+  for (const pattern of DANGEROUS_PATTERNS) {
+    if (pattern.test(command)) return 'dangerous'
+  }
+  return 'safe'
+}
+```
+
+---
+
+## 九、状态管理：双层架构与函数式更新
+
+### 9.1 Bootstrap State（全局单例）
+
+```typescript
+// src/bootstrap/state.ts
+// 使用函数式信号（Signal）实现
+import { createSignal } from 'src/utils/signal.js'
+
+const [state, setState] = createSignal<State>(initialState)
+
+// 全局状态只包含真正跨会话持久的信息
+export type State = {
+  originalCwd: string
+  projectRoot: string
+  totalCostUSD: number
+  totalAPIDuration: number
+  modelUsage: { [modelName: string]: ModelUsage }
+  sessionId: SessionId
+  // 可观测性基础设施
+  meterProvider: MeterProvider | null
+  tracerProvider: BasicTracerProvider | null
+  loggerProvider: LoggerProvider | null
+}
+```
+
+### 9.2 AppState（React 状态树）
+
+```typescript
+// src/state/AppStateStore.ts
+export type AppState = {
+  // 消息状态
+  messages: Message[]
+  pendingMessages: Message[]
+
+  // 任务状态
+  tasks: Task[]
+
+  // 权限状态
+  permissionRequests: PermissionRequest[]
+  isInToolConfirmationDialog: boolean
+  toolPermissionContext: ToolPermissionContext
+
+  // UI 状态
+  verbose: boolean
+  theme: ThemeName
+  isSidebarOpen: boolean
+
+  // 输入状态
+  userInput: string
+  isInputFocused: boolean
+
+  // 投机执行状态
+  speculation: SpeculationState
+}
+```
+
+### 9.3 useSyncExternalStore 集成
+
+```typescript
+// src/state/AppState.tsx
+export function useAppState<T>(selector: (state: AppState) => T): T {
+  const store = useAppStore()
+
+  // 使用 useSyncExternalStore 与 React 18 并发特性兼容
+  return useSyncExternalStore(
+    store.subscribe,           // 订阅函数
+    () => selector(store.getState()),  // 获取快照
+    () => selector(store.getState()),  // SSR 快照
+  )
+}
+```
+
+### 9.4 函数式更新保证并发安全
+
+```typescript
+// 安全的写法：基于最新状态更新
+setAppState(prev => ({
+  ...prev,
+  tasks: [...prev.tasks, newTask]
+}))
+
+// AppStateProvider 实现
+const [store] = useState(() =>
+  createStore(initialState ?? getDefaultAppState(), onChangeAppState)
+)
+
+// store.ts
+export function createStore(initialState: AppState, onChange?: ...) {
+  let state = initialState
+  const listeners = new Set<() => void>()
+
+  return {
+    getState: () => state,
+    setState: (updater: (prev: AppState) => AppState) => {
+      state = updater(state)  // 函数式更新
+      listeners.forEach(l => l())
+    },
+    subscribe: (listener: () => void) => {
+      listeners.add(listener)
+      return () => listeners.delete(listener)
+    },
+  }
+}
+```
+
+---
+
+## 十、TUI 渲染架构：Ink + React Compiler
+
+### 10.1 Ink：React for Terminal
+
+Claude Code 使用 Ink 实现声明式、组件化的终端 UI：
+
+```tsx
+// 简化示例
+import { Box, Text } from 'ink'
+
+function Message({ message }: { message: Message }) {
+  return (
+    <Box flexDirection="column">
+      <Text color={message.role === 'user' ? 'blue' : 'green'}>
+        {message.content}
+      </Text>
+      {message.toolCalls?.map(tool => (
+        <ToolUse key={tool.id} tool={tool} />
+      ))}
+    </Box>
+  )
+}
+```
+
+### 10.2 React Compiler 自动优化
+
+从源码可以看到 React Compiler 的编译痕迹：
+
+```typescript
+// src/state/AppState.tsx
+import { c as _c } from "react/compiler-runtime";
+
+export function AppStateProvider(t0) {
+  const $ = _c(13)  // React Compiler 生成的缓存数组
+  // ...
+  if ($[0] !== initialState || $[1] !== onChangeAppState) {
+    t1 = () => createStore(...)
+    $[0] = initialState
+    $[1] = onChangeAppState
+    $[2] = t1
+  } else {
+    t1 = $[2]  // 复用缓存值
+  }
+  // ...
+}
+```
+
+React Compiler 自动添加 `useMemo`、`useCallback` 等优化，减少不必要的重渲染。
+
+### 10.3 50+ 个 TUI 组件
+
+```
+components/
+├── App.tsx                    # 主应用
+├── Messages.tsx               # 消息列表容器
+├── Message.tsx                # 单条消息
+├── MessageRow.tsx             # 消息行布局
+├── InputBox.tsx               # 输入框
+├── ToolUseProgress.tsx        # 工具执行进度
+├── PermissionDialog.tsx       # 权限确认对话框
+├── CompactSummary.tsx         # 压缩摘要显示
+├── FileEditToolDiff.tsx       # 文件编辑 diff 显示
+├── BashModeProgress.tsx       # Bash 执行进度
+├── CostThresholdDialog.tsx    # 成本阈值提示
+├── ExitFlow.tsx               # 退出流程
+├── LogoV2/                    # 品牌 Logo 动画
+├── HelpV2/                    # 帮助系统
+└── FeedbackSurvey/            # 反馈调查
+```
+
+---
+
+## 十一、记忆系统：四级记忆架构
+
+### 11.1 Memory 目录结构
+
+```
+.claude/
+├── MEMORY.md                  # 记忆索引
+├── memory/
+│   ├── user_role.md           # 用户角色记忆
+│   ├── feedback_*.md          # 行为反馈记忆
+│   ├── project_*.md           # 项目决策记忆
+│   └── reference_*.md         # 外部资源记忆
+└── sessions/                  # 会话持久化
+```
+
+### 11.2 记忆类型定义
+
+```typescript
+// src/memdir/types.ts
+export type MemoryType = 'user' | 'feedback' | 'project' | 'reference'
+
+export type Memory = {
+  name: string
+  description: string
+  type: MemoryType
+  content: string
+  createdAt: Date
+  updatedAt: Date
+}
+```
+
+### 11.3 记忆自动提取
+
+```typescript
+// 当用户说"记住"或纠正 Claude 时自动提取
+function extractMemoryFromConversation(
+  messages: Message[]
+): Memory | null {
+  const lastMessage = messages[messages.length - 1]
+
+  // 检测记忆触发模式
+  if (lastMessage.content.includes('记住')) {
+    return {
+      type: 'project',
+      name: `project_${Date.now()}`,
+      description: extractDescription(lastMessage),
+      content: extractContent(lastMessage),
+    }
+  }
+
+  return null
+}
+```
+
+### 11.4 相关性搜索
+
+```typescript
+// 只加载与当前任务相关的记忆
+async function loadRelevantMemories(
+  query: string,
+  allMemories: Memory[]
+): Promise<Memory[]> {
+  // 使用嵌入向量计算相似度
+  const queryEmbedding = await getEmbedding(query)
+
+  return allMemories
+    .map(m => ({
+      memory: m,
+      similarity: cosineSimilarity(queryEmbedding, m.embedding)
+    }))
+    .filter(({ similarity }) => similarity > 0.7)
+    .sort((a, b) => b.similarity - a.similarity)
+    .slice(0, 5)  // 最多 5 条
+    .map(({ memory }) => memory)
+}
+```
+
+---
+
+## 十二、MCP 协议：工具的互联网
+
+### 12.1 MCP 架构
+
+```
+┌─────────────┐      MCP Protocol      ┌─────────────┐
+│  Claude Code │  ◄──────────────────►  │ MCP Server  │
+│   (Client)   │   stdio / HTTP / SSE   │  (GitHub)   │
+└─────────────┘                        └─────────────┘
+                                              │
+                        ┌─────────────┐      │
+                        │ MCP Server  │◄─────┘
+                        │ (Postgres)  │
+                        └─────────────┘
+```
+
+### 12.2 MCP 客户端实现
+
+```typescript
+// src/services/mcp/client.ts
+export class MCPClient {
+  private transport: MCPTransport
+
+  async connect(): Promise<void> {
+    await this.transport.connect()
+  }
+
+  async listTools(): Promise<MCPTool[]> {
+    return this.transport.request('tools/list')
+  }
+
+  async callTool(name: string, args: unknown): Promise<ToolResult> {
+    return this.transport.request('tools/call', { name, arguments: args })
+  }
+}
+```
+
+### 12.3 动态工具注册
+
+```typescript
+// MCP 工具动态包装成 Claude Code 工具
+function wrapMCPTool(mcpTool: MCPTool, server: MCPServerConnection): Tool {
+  return {
+    name: `mcp__${server.name}__${mcpTool.name}`,  // 命名空间避免冲突
+    description: mcpTool.description,
+    inputSchema: mcpTool.inputSchema,
+
+    async call(input, context) {
+      const result = await server.callTool(mcpTool.name, input)
+      return { type: 'tool_result', data: result }
+    },
+
+    isMcp: true,
+    mcpInfo: { serverName: server.name, toolName: mcpTool.name },
+  }
+}
+```
+
+---
+
+## 十三、性能优化：系统性工程
+
+### 13.1 启动优化
+
+```typescript
+// src/utils/startupProfiler.ts
+export function profileCheckpoint(name: string): void {
+  checkpoints.push({ name, time: performance.now() })
+}
+
+// 输出示例：
+// imports_loaded: 120ms
+// config_read: 45ms
+// mcp_connected: 230ms
+// repl_ready: 395ms（总计）
+```
+
+### 13.2 文件读取缓存
+
+```typescript
+// src/utils/fileStateCache.ts
+type FileStateCache = Map<string, {
+  content: string
+  mtime: number      // 文件修改时间
+  readTime: number   // 读取时间
+}>
+
+async function readFileWithCache(path: string, cache: FileStateCache) {
+  const cached = cache.get(path)
+  const mtime = await getFileMtime(path)
+
+  if (cached && cached.mtime === mtime) {
+    return cached.content  // 缓存命中
+  }
+
+  const content = await readFile(path)
+  cache.set(path, { content, mtime, readTime: Date.now() })
+  return content
+}
+```
+
+### 13.3 提示缓存（Prompt Caching）
+
+```typescript
+// 系统提示构建策略
+const systemPrompt = [
+  coreInstructions,    // [稳定，可缓存] 几乎不变
+  toolDefinitions,     // [稳定，可缓存] 工具集不变时不变
+  claudeMdContent,     // [半稳定] 文件不变时不变
+  gitStatus,           // [动态] 每次可能不同
+  userContext,         // [动态] 每次不同
+]
+
+// Anthropic API 提示缓存可以减少 90%+ 输入 token 费用
+```
+
+### 13.4 ripgrep 集成
+
+```typescript
+// GrepTool 使用 ripgrep 而非 Node.js fs
+// 速度提升 10-100 倍
+
+const rgProcess = spawn('rg', [
+  '--json',           // JSON 输出格式
+  '--context', '2',   // 上下文行数
+  '--case-sensitive',
+  pattern,
+  cwd,
+])
+```
+
+---
+
+## 十四、设计哲学与工程智慧
+
+### 14.1 Unix 哲学的现代演绎
+
+| Unix 原则 | Claude Code 的实现 |
+|-----------|-------------------|
+| 单一职责 | 每个工具只做一件事，复杂任务由 AI 编排 |
+| 组合性 | 工具链式调用，输出作为下一个工具的输入 |
+| 透明性 | 每次工具调用都显示给用户 |
+| 文本流 | 工具通过结构化 JSON 通信 |
+| 可脚本化 | 支持非交互模式，可被脚本调用 |
+
+### 14.2 八大核心设计原则
+
+**1. 透明性优于便利性**
+
+让用户看到 AI 在做什么，建立信任。每次工具调用都显示工具名称、参数和结果。
+
+**2. 安全是默认，便利是可选**
+
+```typescript
+// 危险模式需要明确的标志
+if (allowDangerouslySkipPermissions) {
+  logWarning('Running with --dangerously-skip-permissions')
+}
+```
+
+函数名中的 "Dangerously" 是设计决策，通过命名提醒使用者这是危险操作。
+
+**3. 单一职责，组合完成复杂任务**
+
+- `FileReadTool` 只读文件
+- `FileEditTool` 只做字符串替换
+- 复杂任务由 Claude 的推理能力编排完成
+
+**4. 显式优于隐式**
+
+- 显式上下文传递（ToolUseContext）
+- 显式状态更新（函数式更新）
+- 显式错误处理
+
+**5. 为失败设计**
+
+```typescript
+// 中断处理：为未完成的工具调用生成错误结果
+function* yieldMissingToolResultBlocks(
+  assistantMessages: AssistantMessage[],
+  errorMessage: string,
+) {
+  for (const msg of assistantMessages) {
+    const toolUseBlocks = msg.message.content.filter(
+      c => c.type === 'tool_use'
+    )
+    for (const toolUse of toolUseBlocks) {
+      yield createUserMessage({
+        content: [{
+          type: 'tool_result',
+          content: errorMessage,
+          is_error: true,
+          tool_use_id: toolUse.id,
+        }]
+      })
+    }
+  }
+}
+```
+
+**6. 可观察性是一等公民**
+
+- OpenTelemetry 集成（tracer、meter、logger）
+- API 调用延迟追踪
+- 工具执行时间追踪
+- 成本追踪
+
+**7. 渐进式复杂度**
+
+- 入门：直接输入自然语言
+- 进阶：使用 CLAUDE.md 配置
+- 高级：配置 MCP 服务器
+- 专家：配置权限模型，集成 CI/CD
+
+**8. 代码即文档**
+
+```typescript
+// 注释说明了设计决策
+// Stable project root - set once at startup, never updated mid-session
+// Use for project identity (history, skills, sessions) not file operations
+
+// 注释说明了复杂规则
+/**
+ * The rules of thinking are lengthy and fortuitous...
+ * 1. A message that contains a thinking block must be...
+ * 2. A thinking block may not be the last message in a block
+ * 3. Thinking blocks must be preserved for the duration...
+ */
+```
+
+### 14.3 从聊天机器人到 Agent 的跨越
+
+```
+文本生成：输入文本 → [LLM] → 输出文本
+
+Agent：
+  感知 → 决策 → 行动 → 观察 → 循环
+    ↑                        ↓
+    └────────────────────────┘
+```
+
+完整的 Agent 系统需要：
+- 上下文管理（记住做了什么）
+- 任务规划（知道下一步做什么）
+- 错误处理（出错时怎么办）
+- 权限控制（什么能做什么不能做）
+- 状态持久化（任务中断后能恢复）
+
+---
+
+## 十五、独家技术与架构创新
+
+### 15.1 ToolSearch 延迟加载系统
+
+为解决 43+ 个工具占用过多上下文的问题，Claude Code 实现了 ToolSearch 延迟加载：
+
+```typescript
+// 高频工具始终加载
+const alwaysLoadedTools = ['FileReadTool', 'BashTool', 'GlobTool']
+
+// 低频工具延迟加载
+const deferredTools = [
+  { name: 'LSPTool', searchHint: 'code intelligence lsp go-to-definition' },
+  { name: 'NotebookEditTool', searchHint: 'jupyter notebook ipynb' },
+  ...
+]
+
+// Claude 先用 ToolSearchTool 搜索需要的工具
+const searchResult = await ToolSearchTool.execute({
+  query: 'find code definition'
+})
+// 返回：['LSPTool', 'GrepTool']
+```
+
+### 15.2 多代理颜色系统
+
+```typescript
+// src/tools/AgentTool/agentColorManager.ts
+type AgentColorName =
+  | 'blue' | 'green' | 'yellow' | 'red'
+  | 'cyan' | 'magenta' | 'white'
+
+// 每个代理分配唯一颜色
+const colorManager = {
+  colorMap: new Map<string, AgentColorName>(),
+  colorIndex: 0,
+
+  assignColor(agentId: string): AgentColorName {
+    const colors: AgentColorName[] = ['blue', 'green', 'yellow', 'red', 'cyan']
+    const color = colors[this.colorIndex++ % colors.length]
+    this.colorMap.set(agentId, color)
+    return color
+  }
+}
+```
+
+UI 中不同代理的输出用不同颜色显示，提升多代理场景的可观察性。
+
+### 15.3 Thinking Block 处理
+
+```typescript
+/**
+ * Thinking block 处理规则：
+ * 1. 包含 thinking block 的消息必须属于 max_thinking_length > 0 的查询
+ * 2. thinking block 不能是消息列表的最后一个
+ * 3. thinking block 必须在 assistant trajectory 期间保留
+ *
+ * Heed these rules well, young wizard. For they are the rules of thinking...
+ */
+const MAX_OUTPUT_TOKENS_RECOVERY_LIMIT = 3
+```
+
+### 15.4 Speculation（投机执行）
+
+```typescript
+// src/state/AppStateStore.ts
+type SpeculationState = {
+  isSpeculating: boolean
+  originalMessages: Message[]  // 投机前的消息状态
+  speculatedMessages: Message[] // 投机中的消息状态
+}
+
+// 在计划模式下，Claude 可以"投机"用户的可能回复
+// 如果猜测正确，节省一次 API 调用
+// 如果猜测错误，回滚到 originalMessages
+```
+
+### 15.5 消息规范化（Message Normalization）
+
+```typescript
+// src/utils/queryHelpers.ts
+export function normalizeMessage(message: Message): Message {
+  // 确保 tool_use 和 tool_result 成对出现
+  // 移除重复的 system reminders
+  // 处理 signature block（用于验证消息完整性）
+  // ...
+}
+```
+
+---
+
+## 十六、总结：为什么 Claude Code 的架构优秀
+
+### 16.1 工程化程度高
+
+- 50 万行 TypeScript 代码
+- 43 个内置工具
+- 完整的权限模型（五层架构）
+- 可观测性基础设施（OpenTelemetry）
+- 自动化测试覆盖
+
+### 16.2 架构设计的前瞻性
+
+- **MCP 协议**：AI 工具标准化的未来方向
+- **多代理架构**：超越单 Agent 的上下文限制
+- **上下文工程**：Auto-Compact、CLAUDE.md、Memory 系统化方案
+- **流式处理**：从 API 到 UI 全程流式
+
+### 16.3 对核心问题的深刻洞察
+
+"如何让 AI 安全、可靠、高效地操作真实世界系统"
+
+- **安全**：五层权限模型 + 危险命令检测
+- **可靠**：错误恢复 + 自动压缩 + 熔断机制
+- **高效**：流式处理 + 并行执行 + 提示缓存
+
+### 16.4 开放性和可扩展性
+
+- MCP 协议让能力边界无限扩展
+- Skills 系统让提示模板可复用
+- Plugins 机制支持第三方扩展
+
+### 16.5 对细节的关注
+
+- 工具描述的艺术（直接影响 AI 的工具选择）
+- 颜色系统的设计（多代理可观察性）
+- Token 预算到费用追踪（用户成本控制）
+
+---
+
+Claude Code 的源码是一部关于"如何工程化 AI Agent"的教科书。从 Unix 哲学到 ReAct 框架，从 MCP 协议到多代理架构，它将多种思想融合成一个有机整体。对于 Agent 工程师来说，它的源码是宝贵的学习资源，理解它的设计决策和权衡取舍，能够帮助我们构建更好的 AI Agent 系统。
+
+未来，随着 LLM 能力的增强和 Agent 系统的普及，Claude Code 的架构思想可能会成为行业标准。而它的源码，将始终是一部值得反复研读的工程经典。
+
+---
+
+*本文基于 Claude Code v2.1.88 的源码分析撰写，涵盖 QueryEngine、工具系统、状态管理、上下文工程、权限模型、MCP 协议、多代理架构、性能优化等核心模块。*
+
+---
+
+## 附录：深度技术专题
+
+### A. 钩子系统（Hooks）架构
+
+Claude Code 的钩子系统允许在关键生命周期点注入自定义逻辑，这是其可扩展性的核心机制之一。
+
+#### A.1 钩子类型
+
+```typescript
+// src/types/hooks.ts
+export type HookType =
+  | 'pre_tool_use'      // 工具使用前
+  | 'post_tool_use'     // 工具使用后
+  | 'pre_compact'       // 压缩前
+  | 'post_compact'      // 压缩后
+  | 'session_start'     // 会话开始
+  | 'stop'              // 停止时
+
+export type HookCallback = {
+  matcher: HookCallbackMatcher  // 匹配条件
+  handler: HookHandler          // 处理函数
+}
+```
+
+#### A.2 钩子匹配器
+
+```typescript
+export type HookCallbackMatcher = {
+  tool?: string          // 工具名称匹配（如 "BashTool"）
+  command?: string       // 命令模式匹配（如 "git *"）
+  if?: string            // 条件表达式
+}
+
+// 示例配置
+{
+  matcher: { tool: 'BashTool', command: 'git commit*' },
+  handler: { type: 'require_confirmation' }
+}
+```
+
+#### A.3 钩子执行流程
+
+```
+工具调用请求
+    ↓
+匹配钩子（Hook Matching）
+    ↓
+执行 pre_tool_use 钩子
+    ↓
+权限检查（Permissions）
+    ↓
+执行工具
+    ↓
+执行 post_tool_use 钩子
+    ↓
+返回结果
+```
+
+#### A.4 内置钩子实现
+
+```typescript
+// src/utils/hooks/postSamplingHooks.ts
+export async function executePostSamplingHooks(
+  messages: Message[],
+  context: ToolUseContext
+): Promise<void> {
+  const hooks = getRegisteredHooks('post_sampling')
+
+  for (const hook of hooks) {
+    if (matchesHook(hook.matcher, messages)) {
+      await hook.handler.execute(context)
+    }
+  }
+}
+```
+
+---
+
+### B. 拒绝追踪与优雅降级
+
+Claude Code 实现了精密的拒绝追踪机制，用于处理权限自动分类器的连续失败情况。
+
+#### B.1 DenialTrackingState
+
+```typescript
+// src/utils/permissions/denialTracking.ts
+export type DenialTrackingState = {
+  consecutiveDenials: number  // 连续拒绝次数
+  totalDenials: number        // 总拒绝次数
+}
+
+export const DENIAL_LIMITS = {
+  maxConsecutive: 3,  // 连续 3 次拒绝后降级
+  maxTotal: 20,       // 总计 20 次拒绝后降级
+} as const
+```
+
+#### B.2 降级策略
+
+```typescript
+export function shouldFallbackToPrompting(
+  state: DenialTrackingState
+): boolean {
+  return (
+    state.consecutiveDenials >= DENIAL_LIMITS.maxConsecutive ||
+    state.totalDenials >= DENIAL_LIMITS.maxTotal
+  )
+}
+
+// 当触发降级时，系统从自动模式回退到手动提示模式
+// 确保用户始终能够控制关键操作
+```
+
+#### B.3 状态恢复
+
+```typescript
+export function recordSuccess(
+  state: DenialTrackingState
+): DenialTrackingState {
+  if (state.consecutiveDenials === 0) return state
+  return {
+    ...state,
+    consecutiveDenials: 0,  // 重置连续计数
+  }
+}
+```
+
+---
+
+### C. 代理颜色系统深度解析
+
+多代理场景下的可观察性是复杂系统设计的关键挑战。Claude Code 通过颜色系统优雅解决了这个问题。
+
+#### C.1 颜色定义
+
+```typescript
+// src/tools/AgentTool/agentColorManager.ts
+export type AgentColorName =
+  | 'red' | 'blue' | 'green' | 'yellow'
+  | 'purple' | 'orange' | 'pink' | 'cyan'
+
+export const AGENT_COLORS: readonly AgentColorName[] = [
+  'red', 'blue', 'green', 'yellow',
+  'purple', 'orange', 'pink', 'cyan',
+] as const
+```
+
+#### C.2 颜色分配策略
+
+```typescript
+export function getAgentColor(
+  agentType: string
+): keyof Theme | undefined {
+  // 主代理不使用特殊颜色
+  if (agentType === 'general-purpose') {
+    return undefined
+  }
+
+  const agentColorMap = getAgentColorMap()
+
+  // 已分配的颜色直接复用
+  const existingColor = agentColorMap.get(agentType)
+  if (existingColor && AGENT_COLORS.includes(existingColor)) {
+    return AGENT_COLOR_TO_THEME_COLOR[existingColor]
+  }
+
+  return undefined
+}
+```
+
+#### C.3 UI 渲染效果
+
+```
+[蓝色] Explore 代理：发现 47 个 TypeScript 文件...
+[绿色] Plan 代理：建议的重构方案是...
+[黄色] Review 代理：发现潜在的性能问题...
+```
+
+每种颜色在主题中有专门的定义：
+
+```typescript
+export const AGENT_COLOR_TO_THEME_COLOR = {
+  red: 'red_FOR_SUBAGENTS_ONLY',
+  blue: 'blue_FOR_SUBAGENTS_ONLY',
+  // ...
+} as const satisfies Record<AgentColorName, keyof Theme>
+```
+
+---
+
+### D. 成本追踪系统
+
+Claude Code 内置了精确的成本追踪系统，帮助用户了解 API 调用费用。
+
+#### D.1 成本数据结构
+
+```typescript
+// src/cost-tracker.ts
+export type CostBreakdown = {
+  inputTokens: number
+  outputTokens: number
+  inputCost: number    // 输入费用（美元）
+  outputCost: number   // 输出费用（美元）
+  totalCost: number    // 总费用
+  model: string
+  cachedTokens?: number  // 缓存命中的 tokens（费用更低）
+}
+```
+
+#### D.2 实时累计
+
+```typescript
+// src/bootstrap/state.ts
+export type State = {
+  totalCostUSD: number
+  totalAPIDuration: number
+  totalAPIDurationWithoutRetries: number
+  modelUsage: { [modelName: string]: ModelUsage }
+}
+
+export type ModelUsage = {
+  requestCount: number
+  tokenCount: number
+  costUSD: number
+}
+```
+
+#### D.3 /cost 命令实现
+
+```typescript
+// src/commands/cost/cost.ts
+export async function showCostBreakdown(context: ToolUseContext) {
+  const { totalCostUSD, modelUsage } = getGlobalState()
+
+  const breakdown = Object.entries(modelUsage).map(
+    ([model, usage]) => ({
+      model,
+      requests: usage.requestCount,
+      tokens: usage.tokenCount,
+      cost: formatCost(usage.costUSD),
+    })
+  )
+
+  return {
+    total: formatCost(totalCostUSD),
+    breakdown,
+    savings: calculateCacheSavings(),  // 缓存节省的费用
+  }
+}
+```
+
+---
+
+### E. 文件历史与快照系统
+
+Claude Code 实现了文件历史追踪，支持操作回滚。
+
+#### E.1 快照机制
+
+```typescript
+// src/utils/fileHistory.ts
+export type FileHistoryState = {
+  snapshots: Map<string, FileSnapshot>
+}
+
+export type FileSnapshot = {
+  path: string
+  content: string
+  timestamp: number
+  hash: string  // 内容哈希用于快速比较
+}
+```
+
+#### E.2 自动快照触发
+
+```typescript
+export function fileHistoryMakeSnapshot(
+  state: FileHistoryState,
+  filePath: string,
+  content: string
+): FileHistoryState {
+  const snapshot: FileSnapshot = {
+    path: filePath,
+    content,
+    timestamp: Date.now(),
+    hash: computeHash(content),
+  }
+
+  return {
+    ...state,
+    snapshots: new Map(state.snapshots).set(filePath, snapshot),
+  }
+}
+```
+
+#### E.3 回滚支持
+
+```typescript
+export async function restoreFileFromSnapshot(
+  filePath: string,
+  context: ToolUseContext
+): Promise<boolean> {
+  const state = context.getFileHistoryState()
+  const snapshot = state.snapshots.get(filePath)
+
+  if (!snapshot) return false
+
+  await writeFile(filePath, snapshot.content)
+  return true
+}
+```
+
+---
+
+### F. LSP 集成架构
+
+Claude Code 通过 Language Server Protocol 集成代码智能功能。
+
+#### F.1 LSP 工具实现
+
+```typescript
+// src/tools/LSPTool/
+export type LSPRequest =
+  | { type: 'go_to_definition'; path: string; line: number; character: number }
+  | { type: 'find_references'; path: string; line: number; character: number }
+  | { type: 'hover'; path: string; line: number; character: number }
+  | { type: 'document_symbol'; path: string }
+  | { type: 'workspace_symbol'; query: string }
+```
+
+#### F.2 LSP 客户端管理
+
+```typescript
+// LSP 服务器按工作区管理
+const lspClients = new Map<string, LanguageClient>()
+
+async function getLSPClient(workspace: string): Promise<LanguageClient> {
+  if (lspClients.has(workspace)) {
+    return lspClients.get(workspace)!
+  }
+
+  const client = await createLSPClient(workspace)
+  lspClients.set(workspace, client)
+  return client
+}
+```
+
+#### F.3 与 Agent 循环的集成
+
+```typescript
+// Claude 可以在工具调用中使用 LSP 功能
+const result = await LSPTool.execute({
+  type: 'go_to_definition',
+  path: 'src/utils/api.ts',
+  line: 42,
+  character: 15,
+}, context)
+
+// 返回：定义位置列表
+// [{ path: 'src/types/api.ts', line: 10, character: 0 }]
+```
+
+---
+
+### G. 信号系统（Signal）实现
+
+Bootstrap State 使用轻量级信号系统实现响应式更新。
+
+#### G.1 信号定义
+
+```typescript
+// src/utils/signal.ts
+export type Signal<T> = {
+  get(): T
+  set(value: T): void
+  subscribe(callback: (value: T) => void): () => void
+}
+
+export function createSignal<T>(initialValue: T): Signal<T> {
+  let value = initialValue
+  const subscribers = new Set<(value: T) => void>()
+
+  return {
+    get: () => value,
+    set: (newValue: T) => {
+      if (value === newValue) return
+      value = newValue
+      subscribers.forEach(cb => cb(value))
+    },
+    subscribe: (cb) => {
+      subscribers.add(cb)
+      return () => subscribers.delete(cb)
+    },
+  }
+}
+```
+
+#### G.2 在 Bootstrap State 中的应用
+
+```typescript
+const [state, setState] = createSignal<State>(initialState)
+
+// 组件订阅状态变化
+const unsubscribe = state.subscribe(newState => {
+  updateUI(newState)
+})
+```
+
+---
+
+### H. 任务系统（Task System）
+
+Claude Code 支持后台任务执行，允许长时间运行的操作不阻塞主会话。
+
+#### H.1 任务类型
+
+```typescript
+// src/tasks/
+type Task =
+  | LocalAgentTask      // 本地子代理
+  | LocalShellTask      // 本地 Shell 命令
+  | RemoteAgentTask     // 远程子代理
+  | DreamTask           // 后台分析任务
+  | InProcessTeammateTask  // 同进程队友
+```
+
+#### H.2 任务创建
+
+```typescript
+// src/tools/TaskCreateTool/
+await TaskCreateTool.execute({
+  description: '后台安全扫描',
+  prompt: '分析代码库中的安全漏洞...',
+  run_in_background: true,  // 后台运行
+}, context)
+```
+
+#### H.3 任务状态管理
+
+```typescript
+// src/state/AppStateStore.ts
+type TaskState =
+  | 'pending'
+  | 'running'
+  | 'completed'
+  | 'failed'
+  | 'stopped'
+
+type Task = {
+  id: string
+  description: string
+  state: TaskState
+  progress?: number
+  result?: string
+  error?: string
+}
+```
+
+---
+
+### I. 斜杠命令系统
+
+Claude Code 实现了 40+ 个斜杠命令，提供快捷操作入口。
+
+#### I.1 命令注册
+
+```typescript
+// src/commands.ts
+export type Command = {
+  name: string           // 命令名（如 /cost）
+  description: string    // 描述
+  execute: (args: string[], context: CommandContext) => Promise<void>
+  isEnabled?: () => boolean
+}
+
+// 命令注册
+export const commands: Command[] = [
+  {
+    name: 'cost',
+    description: '显示费用统计',
+    execute: showCostCommand,
+  },
+  {
+    name: 'compact',
+    description: '手动触发上下文压缩',
+    execute: compactCommand,
+  },
+  // ... 40+ 个命令
+]
+```
+
+#### I.2 命令解析
+
+```typescript
+// 用户输入：/cost --detail
+// 解析结果：
+{
+  command: 'cost',
+  args: ['--detail'],
+  raw: '/cost --detail'
+}
+```
+
+#### I.3 命令自动完成
+
+```typescript
+// 提供命令补全建议
+export function getCommandCompletions(partial: string): Command[] {
+  return commands.filter(cmd =>
+    cmd.name.startsWith(partial) &&
+    (cmd.isEnabled?.() ?? true)
+  )
+}
+```
+
+---
+
+### J. 会话持久化与恢复
+
+Claude Code 支持会话的保存和恢复，允许跨会话继续工作。
+
+#### J.1 会话存储格式
+
+```typescript
+// .claude/sessions/{sessionId}.json
+{
+  "version": "2.1.88",
+  "createdAt": "2026-03-31T10:30:00Z",
+  "messages": [...],           // 完整消息历史
+  "fileState": {...},          // 文件缓存状态
+  "tasks": [...],              // 后台任务
+  "cost": {                    // 费用统计
+    "totalUSD": 1.23,
+    "byModel": {...}
+  }
+}
+```
+
+#### J.2 恢复流程
+
+```typescript
+async function restoreSession(sessionId: string): Promise<AppState> {
+  const sessionData = await loadSessionFile(sessionId)
+
+  return {
+    ...getDefaultAppState(),
+    messages: sessionData.messages,
+    tasks: sessionData.tasks,
+    // ... 恢复其他状态
+  }
+}
+```
+
+---
+
+### K. 工具结果预算系统
+
+Claude Code 实现了工具结果预算系统，防止大输出占用过多上下文。
+
+#### K.1 预算配置
+
+```typescript
+// src/utils/toolResultStorage.ts
+export type ContentReplacementState = {
+  replacements: Map<string, ContentReplacement>
+  totalChars: number
+  budget: number
+}
+
+type ContentReplacement = {
+  originalContent: string
+  replacementId: string
+  charCount: number
+}
+```
+
+#### K.2 动态替换策略
+
+```typescript
+export function applyToolResultBudget(
+  content: string,
+  state: ContentReplacementState
+): { content: string; state: ContentReplacementState } {
+  const projectedTotal = state.totalChars + content.length
+
+  // 如果超出预算，将内容持久化到文件
+  if (projectedTotal > state.budget) {
+    const replacementId = generateReplacementId()
+    const filePath = persistToFile(content, replacementId)
+
+    return {
+      content: `[内容已持久化到 ${filePath}]`,
+      state: {
+        ...state,
+        replacements: new Map(state.replacements).set(replacementId, {
+          originalContent: content,
+          replacementId,
+          charCount: content.length,
+        }),
+      },
+    }
+  }
+
+  return {
+    content,
+    state: {
+      ...state,
+      totalChars: projectedTotal,
+    },
+  }
+}
+```
+
+---
+
+### L. 取消与中断系统
+
+Claude Code 实现了完善的中断处理机制，支持用户随时取消操作。
+
+#### L.1 AbortController 层级
+
+```typescript
+// src/utils/abortController.ts
+export function createAbortController(): AbortController {
+  return new AbortController()
+}
+
+export function createChildAbortController(
+  parent: AbortController
+): AbortController {
+  const child = new AbortController()
+
+  // 父级取消时自动取消子级
+  parent.signal.addEventListener('abort', () => {
+    child.abort(parent.signal.reason)
+  })
+
+  return child
+}
+```
+
+#### L.2 工具中断行为
+
+```typescript
+// Tool.ts 中定义的中断行为
+type InterruptBehavior = 'cancel' | 'block'
+
+// BashTool: 中断时终止子进程
+interruptBehavior: () => 'cancel'
+
+// FileReadTool: 中断时阻止新输入
+interruptBehavior: () => 'block'
+```
+
+#### L.3 中断信号传播
+
+```
+用户按下 Ctrl+C
+    ↓
+主 AbortController.abort('user_interrupt')
+    ↓
+StreamingToolExecutor.siblingAbortController
+    ↓
+各工具的 toolAbortController
+    ↓
+Bash 子进程收到 SIGTERM
+```
+
+---
+
+### M. 测试基础设施
+
+Claude Code 拥有完善的测试体系，确保复杂系统的可靠性。
+
+#### M.1 测试分层
+
+```
+tests/
+├── unit/                    # 单元测试
+│   ├── tools/              # 工具测试
+│   ├── utils/              # 工具函数测试
+│   └── services/           # 服务测试
+├── integration/            # 集成测试
+│   ├── query.test.ts       # QueryEngine 集成测试
+│   └── mcp.test.ts         # MCP 集成测试
+├── e2e/                    # 端到端测试
+│   └── cli.test.ts         # CLI 完整流程测试
+└── fixtures/               # 测试固件
+```
+
+#### M.2 工具测试模式
+
+```typescript
+// 测试工具的标准模式
+describe('FileEditTool', () => {
+  it('should edit file content', async () => {
+    // 1. 准备测试环境
+    const tempDir = await createTempDir()
+    const filePath = join(tempDir, 'test.txt')
+    await writeFile(filePath, 'original content')
+
+    // 2. 创建模拟上下文
+    const context = createMockToolUseContext({ cwd: tempDir })
+
+    // 3. 执行工具
+    const result = await FileEditTool.call(
+      { file_path: filePath, old_string: 'original', new_string: 'modified' },
+      context,
+      () => ({ behavior: 'allow' }),
+      createMockAssistantMessage()
+    )
+
+    // 4. 验证结果
+    expect(result.data).toBeDefined()
+    const newContent = await readFile(filePath, 'utf-8')
+    expect(newContent).toBe('modified content')
+
+    // 5. 清理
+    await cleanupTempDir(tempDir)
+  })
+})
+```
+
+#### M.3 Mock 系统
+
+```typescript
+// 模拟 API 响应
+export function mockAnthropicAPI(
+  responses: MockMessageResponse[]
+): MockInstance {
+  return vi.spyOn(Anthropic.prototype.messages, 'stream')
+    .mockImplementation(async function* () {
+      for (const response of responses) {
+        yield createMockStreamChunk(response)
+      }
+    })
+}
+
+// 模拟文件系统
+export function mockFileSystem(
+  files: Record<string, string>
+): void {
+  vi.mock('fs/promises', () => ({
+    readFile: (path: string) => {
+      if (files[path]) return Promise.resolve(files[path])
+      throw new Error(`ENOENT: ${path}`)
+    },
+    writeFile: vi.fn(),
+  }))
+}
+```
+
+---
+
+### N. 构建与发布流程
+
+Claude Code 使用 Bun 构建系统实现高效的打包和发布。
+
+#### N.1 bun:bundle 配置
+
+```json
+// build.config.json
+{
+  "entrypoints": ["src/entrypoints/cli.tsx"],
+  "outdir": "./dist",
+  "target": "node",
+  "format": "esm",
+  "splitting": true,
+  "sourcemap": true,
+  "minify": {
+    "whitespace": true,
+    "syntax": true
+  },
+  "define": {
+    "MACRO.VERSION": "\"2.1.88\""
+  }
+}
+```
+
+#### N.2 特性标志处理
+
+```typescript
+// 构建时处理 feature() 调用
+// 输入代码：
+const VoiceProvider = feature('VOICE_MODE')
+  ? require('../context/voice.js').VoiceProvider
+  : ({ children }) => children
+
+// 如果 VOICE_MODE 未启用，构建输出：
+const VoiceProvider = ({ children }) => children
+
+// 如果 VOICE_MODE 启用，构建输出：
+import { VoiceProvider } from '../context/voice.js'
+```
+
+#### N.3 多平台发布
+
+```yaml
+# release.yml
+jobs:
+  build:
+    strategy:
+      matrix:
+        platform:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - runner: macos-latest
+            target: x86_64-apple-darwin
+          - runner: macos-latest
+            target: aarch64-apple-darwin
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+```
+
+---
+
+### O. 桥接层与远程会话
+
+Claude Code 支持通过桥接层在远程环境中运行，实现云端代理执行。
+
+#### O.1 桥接架构
+
+```
+本地终端                    远程服务器
+┌─────────────┐           ┌─────────────┐
+│  CLI 前端   │◄─────────►│  Bridge API │
+│  (Ink TUI)  │  WebSocket│  (REST/SSE) │
+└─────────────┘           └──────┬──────┘
+                                 │
+                          ┌──────┴──────┐
+                          │ QueryEngine │
+                          │ (Agent 循环) │
+                          └──────┬──────┘
+                                 │
+                          ┌──────┴──────┐
+                          │  工具执行层  │
+                          └─────────────┘
+```
+
+#### O.2 桥接消息协议
+
+```typescript
+// src/bridge/types.ts
+export type BridgeMessage =
+  | { type: 'input'; content: string; timestamp: number }
+  | { type: 'output'; content: Message[]; timestamp: number }
+  | { type: 'tool_request'; toolUse: ToolUseBlock }
+  | { type: 'tool_response'; result: ToolResult }
+  | { type: 'permission_request'; request: PermissionRequest }
+  | { type: 'permission_response'; granted: boolean }
+  | { type: 'heartbeat'; timestamp: number }
+```
+
+#### O.3 传输层实现
+
+```typescript
+// src/cli/transports/WebSocketTransport.ts
+export class WebSocketTransport implements BridgeTransport {
+  private ws: WebSocket
+  private messageQueue: BridgeMessage[] = []
+
+  constructor(url: string) {
+    this.ws = new WebSocket(url)
+    this.ws.onmessage = (event) => {
+      const message = JSON.parse(event.data)
+      this.handleMessage(message)
+    }
+  }
+
+  async send(message: BridgeMessage): Promise<void> {
+    if (this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify(message))
+    } else {
+      this.messageQueue.push(message)
+    }
+  }
+
+  private handleMessage(message: BridgeMessage): void {
+    // 处理远程消息
+    emit('bridge:message', message)
+  }
+}
+```
+
+---
+
+### P. 配置管理系统
+
+Claude Code 实现了多层级配置系统，支持用户、项目、会话级配置。
+
+#### P.1 配置层级
+
+```
+配置优先级（高到低）：
+
+1. 命令行参数 (--flags)
+2. 会话级设置 (/set 命令)
+3. 项目级配置 (.claude/settings.json)
+4. 用户级配置 (~/.claude/settings.json)
+5. 系统默认值
+```
+
+#### P.2 配置类型
+
+```typescript
+// src/utils/settings/types.ts
+export type ClaudeSettings = {
+  // 模型设置
+  model?: string
+  thinking?: boolean
+
+  // 权限设置
+  permissions?: PermissionSettings
+
+  // UI 设置
+  theme?: 'light' | 'dark' | 'system'
+  verbose?: boolean
+
+  // MCP 服务器
+  mcpServers?: MCPServerConfig[]
+
+  // 代理设置
+  agent?: {
+    maxTurns?: number
+    maxBudgetUsd?: number
+  }
+}
+```
+
+#### P.3 配置热重载
+
+```typescript
+// src/hooks/useSettingsChange.ts
+export function useSettingsChange(
+  onChange: (source: SettingSource) => void
+): void {
+  useEffect(() => {
+    const watcher = watchConfigFiles((changedFile) => {
+      onChange(determineSettingSource(changedFile))
+    })
+
+    return () => watcher.close()
+  }, [onChange])
+}
+```
+
+---
+
+### Q. Vim 模式支持
+
+Claude Code 内置 Vim 模式，支持键盘驱动的高效操作。
+
+#### Q.1 模式状态机
+
+```typescript
+// src/vim/
+export type VimMode =
+  | 'normal'    // 普通模式
+  | 'insert'    // 插入模式
+  | 'visual'    // 可视模式
+  | 'command'   // 命令模式
+
+type VimState = {
+  mode: VimMode
+  commandBuffer: string
+  visualStart: CursorPosition | null
+  lastChange: ChangeRecord | null
+}
+```
+
+#### Q.2 快捷键绑定
+
+```typescript
+// src/keybindings/
+export const defaultKeybindings: Keybinding[] = [
+  { key: 'i', mode: 'normal', action: 'enter_insert_mode' },
+  { key: 'Escape', mode: 'insert', action: 'enter_normal_mode' },
+  { key: ':', mode: 'normal', action: 'enter_command_mode' },
+  { key: 'Ctrl+c', mode: '*', action: 'interrupt' },
+  { key: 'Ctrl+d', mode: '*', action: 'exit' },
+  // ... 更多绑定
+]
+```
+
+---
+
+### R. 安全沙箱机制
+
+Claude Code 实现了多层安全机制，防止 AI 执行危险操作。
+
+#### R.1 路径隔离
+
+```typescript
+// src/utils/permissions/filesystem.ts
+export function isPathWithinAllowedDirectories(
+  targetPath: string,
+  allowedDirs: string[]
+): boolean {
+  const resolved = realpathSync(targetPath)
+
+  return allowedDirs.some(dir => {
+    const allowed = realpathSync(dir)
+    return resolved.startsWith(allowed)
+  })
+}
+```
+
+#### R.2 命令沙箱
+
+```typescript
+// BashTool 的安全检查
+const BLOCKED_PATTERNS = [
+  /rm\s+-rf\s+\//,                    // 删除根目录
+  />\s*\/dev\/(sda|disk|rdisk)/,      // 写入磁盘设备
+  /curl.*\|.*(sh|bash|zsh)/,          // 远程脚本执行
+  /wget.*\|.*(sh|bash|zsh)/,
+  /mkfs\.\w+/,                        // 格式化文件系统
+  /dd\s+if=.*of=\/dev/,               // 磁盘写入
+]
+
+function isCommandSafe(command: string): boolean {
+  return !BLOCKED_PATTERNS.some(pattern => pattern.test(command))
+}
+```
+
+#### R.3 网络隔离
+
+```typescript
+// 限制 MCP 服务器的网络访问
+export type MCPServerSecurity = {
+  allowedHosts?: string[]      // 允许访问的主机
+  blockedHosts?: string[]      // 禁止访问的主机
+  allowLocalhost?: boolean     // 是否允许本地访问
+  maxRequestSize?: number      // 最大请求大小
+}
+```
+
+---
+
+### S. 消息规范化与验证
+
+Claude Code 实现了严格的消息规范化机制，确保对话历史的完整性和一致性。
+
+#### S.1 消息配对验证
+
+```typescript
+// src/utils/queryHelpers.ts
+/**
+ * 确保每个 tool_use 都有对应的 tool_result
+ * 这是保证对话历史完整性的关键
+ */
+export function normalizeMessages(messages: Message[]): Message[] {
+  const normalized: Message[] = []
+  const pendingToolUses = new Map<string, ToolUseBlock>()
+
+  for (const message of messages) {
+    if (message.type === 'assistant') {
+      // 记录 tool_use
+      for (const block of message.content) {
+        if (block.type === 'tool_use') {
+          pendingToolUses.set(block.id, block)
+        }
+      }
+      normalized.push(message)
+    }
+    else if (message.type === 'user') {
+      // 检查 tool_result 是否匹配
+      for (const block of message.content) {
+        if (block.type === 'tool_result') {
+          if (!pendingToolUses.has(block.tool_use_id)) {
+            // 孤儿 tool_result，可能是压缩导致的
+            // 创建合成 tool_use 来配对
+            normalized.push(createSyntheticToolUse(block.tool_use_id))
+          }
+          pendingToolUses.delete(block.tool_use_id)
+        }
+      }
+      normalized.push(message)
+    }
+  }
+
+  // 为未完成的 tool_use 创建合成错误结果
+  for (const [id, toolUse] of pendingToolUses) {
+    normalized.push(createSyntheticToolResult(id, 'interrupted'))
+  }
+
+  return normalized
+}
+```
+
+#### S.2 签名块处理
+
+```typescript
+/**
+ * 移除签名块用于 API 调用
+ * 签名块仅用于本地验证，不应发送到 API
+ */
+export function stripSignatureBlocks(messages: Message[]): Message[] {
+  return messages.map(message => {
+    if (message.type !== 'assistant') return message
+
+    return {
+      ...message,
+      content: message.content.filter(
+        block => block.type !== 'signature'
+      )
+    }
+  })
+}
+```
+
+---
+
+### T. 思考块（Thinking Block）管理
+
+Claude Code 支持 Claude 模型的思考模式，实现深度推理。
+
+#### T.1 思考块规则
+
+```typescript
+/**
+ * 思考块处理规则：
+ * 1. 思考块只能在 max_thinking_length > 0 的查询中出现
+ * 2. 思考块不能是消息列表的最后一个块
+ * 3. 思考块必须在 assistant trajectory 期间保留
+ * 4. tool_use 后必须保留思考块直到 tool_result
+ */
+export function validateThinkingBlocks(
+  messages: Message[],
+  config: ThinkingConfig
+): ValidationResult {
+  if (!config.enabled) {
+    // 未启用思考模式时，不应有思考块
+    const hasThinking = messages.some(m =>
+      m.type === 'assistant' &&
+      m.content.some(b => b.type === 'thinking')
+    )
+    if (hasThinking) {
+      return { valid: false, error: 'Unexpected thinking block' }
+    }
+  }
+
+  // 验证思考块位置
+  for (let i = 0; i < messages.length; i++) {
+    const message = messages[i]
+    if (message.type !== 'assistant') continue
+
+    const blocks = message.content
+    const thinkingIndices = blocks
+      .map((b, idx) => b.type === 'thinking' ? idx : -1)
+      .filter(idx => idx !== -1)
+
+    // 思考块不能是最后一个块（除非后面跟着 tool_use）
+    for (const idx of thinkingIndices) {
+      const isLastBlock = idx === blocks.length - 1
+      const nextBlockIsToolUse = blocks[idx + 1]?.type === 'tool_use'
+
+      if (isLastBlock && !nextBlockIsToolUse) {
+        return {
+          valid: false,
+          error: 'Thinking block cannot be the last block'
+        }
+      }
+    }
+  }
+
+  return { valid: true }
+}
+```
+
+#### T.2 思考块与工具调用
+
+```typescript
+/**
+ * 当存在工具调用时，思考块的生命周期延长：
+ * - 从 tool_use 到 tool_result 再到下一个 assistant message
+ * - 这期间思考块不能被压缩或删除
+ */
+export function isThinkingPreservationRequired(
+  messageIndex: number,
+  messages: Message[]
+): boolean {
+  const current = messages[messageIndex]
+  if (current.type !== 'assistant') return false
+
+  // 检查是否有未完成的工具调用
+  const hasPendingToolUse = current.content.some(
+    block => block.type === 'tool_use'
+  )
+
+  // 检查下一个消息是否是配对的 tool_result
+  const nextMessage = messages[messageIndex + 1]
+  const hasMatchingToolResult = nextMessage?.type === 'user' &&
+    nextMessage.content.some(
+      block => block.type === 'tool_result' &&
+        current.content.some(
+          toolUse => toolUse.type === 'tool_use' &&
+            toolUse.id === block.tool_use_id
+        )
+    )
+
+  return hasPendingToolUse && hasMatchingToolResult
+}
+```
+
+---
+
+### U. 投机执行（Speculation）
+
+Claude Code 实现了投机执行机制，优化计划模式下的交互延迟。
+
+#### U.1 投机状态管理
+
+```typescript
+// src/state/AppStateStore.ts
+export type SpeculationState =
+  | { type: 'idle' }
+  | {
+      type: 'speculating'
+      originalMessages: Message[]      // 原始消息备份
+      speculatedMessages: Message[]    // 投机中的消息
+      speculationPrompt: string        // 投机提示
+      confidence: number               // 置信度
+    }
+  | {
+      type: 'confirmed'
+      acceptedMessages: Message[]
+    }
+  | {
+      type: 'rejected'
+      restoredMessages: Message[]
+    }
+```
+
+#### U.2 投机执行流程
+
+```
+用户输入计划模式
+    ↓
+Claude 生成计划
+    ↓
+[投机] 预测用户会同意计划
+    ↓
+基于预测开始执行第一步
+    ↓
+用户实际输入
+    ├─ 同意 → 接受投机结果，继续执行
+    └─ 修改 → 回滚到原始状态，根据修改重新执行
+```
+
+#### U.3 回滚机制
+
+```typescript
+export function rejectSpeculation(
+  state: AppState
+): AppState {
+  if (state.speculation.type !== 'speculating') {
+    return state
+  }
+
+  // 恢复原始消息
+  return {
+    ...state,
+    messages: state.speculation.originalMessages,
+    speculation: {
+      type: 'rejected',
+      restoredMessages: state.speculation.originalMessages
+    }
+  }
+}
+```
+
+---
+
+### V. 文件状态缓存优化
+
+Claude Code 实现了智能文件缓存，减少重复读取。
+
+#### V.1 缓存数据结构
+
+```typescript
+// src/utils/fileStateCache.ts
+export type FileStateCache = Map<string, FileCacheEntry>
+
+type FileCacheEntry = {
+  content: string
+  mtime: number        // 修改时间（用于失效检测）
+  readTime: number     // 读取时间（用于 LRU）
+  size: number         // 文件大小
+  hash?: string        // 内容哈希（可选，用于快速比较）
+}
+```
+
+#### V.2 LRU 淘汰策略
+
+```typescript
+const MAX_CACHE_ENTRIES = 100
+const MAX_CACHE_AGE_MS = 5 * 60 * 1000  // 5 分钟
+
+export function cleanupCache(cache: FileStateCache): FileStateCache {
+  const now = Date.now()
+  const entries = Array.from(cache.entries())
+
+  // 按读取时间排序（LRU）
+  entries.sort((a, b) => b[1].readTime - a[1].readTime)
+
+  // 删除过期项和超量项
+  const toKeep = entries.filter(([, entry], index) => {
+    const notExpired = now - entry.readTime < MAX_CACHE_AGE_MS
+    const withinLimit = index < MAX_CACHE_ENTRIES
+    return notExpired && withinLimit
+  })
+
+  return new Map(toKeep)
+}
+```
+
+---
+
+### W. 动态技能加载（Dynamic Skills）
+
+Claude Code 支持动态技能加载，允许在运行时发现和加载新能力。
+
+#### W.1 技能发现机制
+
+```typescript
+// src/services/skillSearch/
+export type Skill = {
+  name: string
+  description: string
+  prompt: string
+  triggers: string[]      // 触发关键词
+  examples: Example[]
+}
+
+export async function discoverSkills(
+  query: string,
+  availableSkills: Skill[]
+): Promise<Skill[]> {
+  // 计算查询与技能描述的相似度
+  const scored = await Promise.all(
+    availableSkills.map(async skill => ({
+      skill,
+      score: await calculateRelevance(query, skill)
+    }))
+  )
+
+  return scored
+    .filter(({ score }) => score > 0.6)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 3)
+    .map(({ skill }) => skill)
+}
+```
+
+#### W.2 技能注入
+
+```typescript
+export function injectSkillsIntoPrompt(
+  systemPrompt: string,
+  skills: Skill[]
+): string {
+  const skillSections = skills.map(skill => `
+## ${skill.name}
+${skill.description}
+
+触发条件: ${skill.triggers.join(', ')}
+
+使用示例:
+${skill.examples.map(e => `- ${e.description}`).join('\n')}
+
+详细提示:
+${skill.prompt}
+`).join('\n---\n')
+
+  return `${systemPrompt}\n\n${skillSections}`
+}
+```
+
+---
+
+### X. 迁移系统（Migrations）
+
+Claude Code 实现了配置和数据迁移系统，确保版本升级平滑过渡。
+
+#### X.1 迁移定义
+
+```typescript
+// src/migrations/
+export type Migration = {
+  version: string
+  description: string
+  up: () => Promise<void>
+  down?: () => Promise<void>
+}
+
+export const migrations: Migration[] = [
+  {
+    version: '2.1.0',
+    description: 'Migrate settings format',
+    up: async () => {
+      const oldSettings = await loadOldSettings()
+      const newSettings = transformSettings(oldSettings)
+      await saveNewSettings(newSettings)
+    }
+  },
+  // ... 更多迁移
+]
+```
+
+#### X.2 迁移执行
+
+```typescript
+export async function runMigrations(
+  currentVersion: string,
+  targetVersion: string
+): Promise<void> {
+  const toApply = migrations.filter(m =>
+    compareVersions(m.version, currentVersion) > 0 &&
+    compareVersions(m.version, targetVersion) <= 0
+  )
+
+  for (const migration of toApply) {
+    console.log(`Applying migration: ${migration.version}`)
+    await migration.up()
+    await recordMigration(migration.version)
+  }
+}
+```
+
+---
+
+### Y. 日志与调试系统
+
+Claude Code 实现了多层级日志系统，支持开发和生产环境的不同需求。
+
+#### Y.1 日志级别
+
+```typescript
+// src/utils/log.ts
+export type LogLevel = 'debug' | 'info' | 'warn' | 'error'
+
+export function logError(error: Error, context?: Record<string, unknown>): void {
+  const entry = {
+    timestamp: new Date().toISOString(),
+    level: 'error',
+    message: error.message,
+    stack: error.stack,
+    context,
+    sessionId: getSessionId()
+  }
+
+  // 写入内存错误日志（用于 /doctor 命令）
+  addToInMemoryErrorLog(entry)
+
+  // 写入文件（如果配置了）
+  if (process.env.CLAUDE_CODE_LOG_FILE) {
+    appendFileSync(process.env.CLAUDE_CODE_LOG_FILE, JSON.stringify(entry) + '\n')
+  }
+
+  // 发送遥测（去敏感化）
+  sendErrorTelemetry(sanitizeErrorForTelemetry(entry))
+}
+```
+
+#### Y.2 调试模式
+
+```typescript
+// src/utils/debug.ts
+export function logForDebugging(label: string, data?: unknown): void {
+  if (!isDebugEnabled()) return
+
+  const timestamp = new Date().toISOString()
+  console.error(`[DEBUG ${timestamp}] ${label}`, data)
+}
+
+export function isDebugEnabled(): boolean {
+  return process.env.CLAUDE_CODE_DEBUG === 'true' ||
+    process.env.DEBUG?.includes('claude-code')
+}
+```
+
+---
+
+### Z. 文档生成与内联帮助
+
+Claude Code 内置了帮助系统，支持动态生成文档。
+
+#### Z.1 工具文档生成
+
+```typescript
+// 从工具定义自动生成文档
+export function generateToolDocumentation(
+  tool: Tool
+): string {
+  const sections = [
+    `# ${tool.name}`,
+    '',
+    tool.description,
+    '',
+    '## 参数',
+    '',
+    generateSchemaDocumentation(tool.inputSchema),
+    '',
+    '## 示例',
+    '',
+    generateUsageExamples(tool),
+  ]
+
+  return sections.join('\n')
+}
+```
+
+#### Z.2 内联帮助
+
+```typescript
+// /help 命令实现
+export async function showHelp(
+  topic?: string
+): Promise<string> {
+  if (!topic) {
+    return `
+可用帮助主题:
+- /help commands    - 斜杠命令列表
+- /help tools       - 工具参考
+- /help shortcuts   - 键盘快捷键
+- /help permissions - 权限系统
+- /help mcp         - MCP 协议
+
+输入 /help <主题> 查看详细信息。
+`
+  }
+
+  switch (topic) {
+    case 'commands':
+      return generateCommandsHelp()
+    case 'tools':
+      return generateToolsHelp()
+    // ...
+  }
+}
+```
+
+---
+
+## 结语
+
+Claude Code 的源码展示了 AI Agent 工程化的完整范式。从 QueryEngine 的 PDAOL 循环到 StreamingToolExecutor 的流式执行，从 Auto-Compact 的智能压缩到 MCP 协议的开放扩展，每个模块都体现了对核心问题的深刻洞察。
+
+其架构设计的关键成功因素包括：
+
+1. **清晰的分层架构**：五层架构（UI、Session、Core、Context、Infrastructure）职责明确
+2. **流式处理优先**：从 API 到 UI 全程流式，自然实现背压控制
+3. **防御性设计**：五层权限模型、熔断机制、优雅降级
+4. **可观察性内置**：OpenTelemetry、成本追踪、性能监控
+5. **开放扩展**：MCP 协议、钩子系统、插件架构
+6. **工程卓越**：50 万行 TypeScript 代码，完整测试覆盖，生产级可观测性
+
+这些设计不仅适用于 AI Agent 系统，也为任何复杂的工程系统提供了参考范式。Claude Code 的源码将始终是 AI Agent 工程领域的经典教材，值得每一位工程师深入研读。
+
+从代码中我们可以看到，构建生产级 AI Agent 需要的不仅是 LLM 调用，还包括：状态管理、并发控制、流式处理、权限系统、错误恢复、上下文工程、可观测性等全方位的工程能力。Claude Code 在这些方面提供了行业标杆级的实现，其设计决策和权衡值得深入学习。
+
+---
+
+*本文基于 Claude Code v2.1.88 源码深度分析，涵盖 60+ 个核心模块和独家技术实现。*
